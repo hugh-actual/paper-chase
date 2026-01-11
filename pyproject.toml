@@ -2,17 +2,15 @@
 name = "paper-chase"
 version = "0.1.0"
 description = "simple python scripts to organise a pdf collection"
-requires-python = ">=3.9"
+requires-python = ">=3.11"
 dependencies = [
     "pypdf2>=3.0.1",
     "python-dotenv>=1.0.0",
 ]
 
-[project.optional-dependencies]
-dev = ["pytest>=8.0"]
-
 [dependency-groups]
 dev = [
     "black>=25.11.0",
     "flake8>=7.3.0",
+    "pytest>=8.0",
 ]
