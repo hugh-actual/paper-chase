@@ -8,11 +8,9 @@ dependencies = [
     "python-dotenv>=1.0.0",
 ]
 
-[project.optional-dependencies]
-dev = ["pytest>=8.0"]
-
 [dependency-groups]
 dev = [
     "black>=25.11.0",
     "flake8>=7.3.0",
+    "pytest>=8.0",
 ]
