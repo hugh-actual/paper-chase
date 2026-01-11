@@ -1,7 +1,7 @@
 [project]
-name = "document-processor"
+name = "paper-chase"
 version = "0.1.0"
-description = "Add your description here"
+description = "simple python scripts to organise a pdf collection"
 requires-python = ">=3.9"
 dependencies = [
     "pypdf2>=3.0.1",

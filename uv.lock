@@ -139,7 +139,7 @@ wheels = [
 ]
 
 [[package]]
-name = "document-processor"
+name = "paper-chase"
 version = "0.1.0"
 source = { virtual = "." }
 dependencies = [

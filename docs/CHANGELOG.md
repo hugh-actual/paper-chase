@@ -15,7 +15,7 @@
 | Variable | Purpose |
 |----------|---------|
 | `DOCS_BASE_DIR` | Base docs directory |
-| `PROCESSOR_DIR` | document-processor directory |
+| `PROCESSOR_DIR` | paper-chase directory |
 | `REFERENCE_DIR` | Renamed PDFs location |
 | `QUARANTINE_DIR` | Off-topic files location |
 | `TODO_DIR` | Inbox for new PDFs |
