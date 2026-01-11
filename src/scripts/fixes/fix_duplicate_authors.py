@@ -7,7 +7,7 @@ from pathlib import Path
 from src.lib.utils import parse_author
 
 # Load references.json
-refs_path = Path("/Users/hw/docs/references.json")
+refs_path = Path("~/docs/references.json")
 with open(refs_path, "r") as f:
     references = json.load(f)
 

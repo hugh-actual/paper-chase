@@ -58,7 +58,7 @@ uv run python script_name.py
 
 ```bash
 cd ~/{???}/paper-chase
-/Users/hw/.local/bin/uv run python script_name.py
+~/.local/bin/uv run python script_name.py
 ```
 
 ## Examples
