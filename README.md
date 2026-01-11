@@ -111,11 +111,11 @@ make extract FILE=/path/to/file.pdf
 
 ```
 ~/{docs_folder}/
-├── reference/        # Your organized PDF library (415 files)
+├── reference/        # Your organized PDF library
 ├── quarantine/       # Duplicates and removed files
 ├── todo/             # New PDFs to process
 ├── references.json   # Metadata database (source of truth)
-└── references.md     # Human-readable bibliography
+└── references.md     # Human-readable bibliography (generated from `.json`)
 ```
 
 ## Naming Convention

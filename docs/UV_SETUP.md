@@ -2,7 +2,7 @@
 
 ## Current Status
 
-✓ `uv` v0.9.18 is installed at: `/Users/hw/.local/bin/uv`
+✓ `uv` v0.9.18 is installed at: `~/.local/bin/uv`
 
 ## Quick Setup
 
@@ -50,22 +50,15 @@ Should output: `uv 0.9.18 (0cee76417 2025-12-16)`
 ### Option 1: After adding to PATH (recommended)
 
 ```bash
-cd /Users/hw/Docs/document-processor
+cd ~/{???}/paper-chase
 uv run python script_name.py
 ```
 
 ### Option 2: Using full path (works now)
 
 ```bash
-cd /Users/hw/Docs/document-processor
+cd ~/{???}/paper-chase
 /Users/hw/.local/bin/uv run python script_name.py
-```
-
-### Option 3: Without uv (always works)
-
-```bash
-cd /Users/hw/Docs/document-processor
-.venv/bin/python3 script_name.py
 ```
 
 ## Examples
@@ -77,25 +70,22 @@ cd /Users/hw/Docs/document-processor
 uv run python verify_files_and_metadata.py
 
 # With full path:
-/Users/hw/.local/bin/uv run python verify_files_and_metadata.py
+~/.local/bin/uv run python verify_files_and_metadata.py
 
-# Without uv:
-.venv/bin/python3 verify_files_and_metadata.py
 ```
 
 ### Extract PDF metadata:
 
 ```bash
 # With uv in PATH:
-uv run python extract_metadata.py "/Users/hw/Docs/reference/some_file.pdf"
+uv run python extract_metadata.py "/path/to/some_file.pdf"
 
 # With full path:
-/Users/hw/.local/bin/uv run python extract_metadata.py "/Users/hw/Docs/reference/some_file.pdf"
+~/.local/bin/uv run python extract_metadata.py "/Users/you/some/other/some_file.pdf"
 
-# Without uv:
-.venv/bin/python3 extract_metadata.py "/Users/hw/Docs/reference/some_file.pdf"
+
 ```
 
 ---
 
-**All three methods work perfectly!** Choose whichever is most convenient for you.
+Choose whichever is most convenient for you.
