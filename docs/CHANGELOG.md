@@ -4,6 +4,23 @@
 
 ---
 
+## Broken-Title Patterns Made Generic (2026-07-24)
+
+- Moved collection-specific title patterns out of `find_broken_titles.py` and into
+  the untracked `local_title_patterns.json`, where the module docstring already
+  said they belonged. Tracked source now holds only generic checks: authoring-tool
+  signatures and structural damage, never subject matter
+- Added the generic patterns that were missing, notably `Microsoft Word - ` (a very
+  common broken PDF title that previously passed through and was filed as a real
+  entry), plus PowerPoint/InDesign artifacts, `Slide N`/`Chapter N`, and `.docx`/
+  `.pptx` extensions. Placeholder and short-title matching is now case-insensitive
+- Added unit tests for the built-in patterns, which had none, including a guard that
+  fails if topic-based literals are reintroduced to tracked source. Its fixtures are
+  invented rather than real titles, so the guard cannot itself leak what it protects
+  against (131 → 153 tests)
+
+---
+
 ## Ingest Conflict Detection Fix (2026-07-24)
 
 - Fixed byte-identical duplicates being silently ingested when they arrived in

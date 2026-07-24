@@ -61,14 +61,13 @@ def is_broken_title(title, author, filename, local_patterns=None):
     # DEFINITELY BROKEN: Generic placeholder titles
     generic_placeholders = [
         r"^My title$",
-        r"^Untitled$",
-        r"^untitled$",
+        r"^untitled\b",
         r"^Data Driven$",
         r"^Deep Learning$",
         r"^Machine Learning$",
     ]
     for pattern in generic_placeholders:
-        if re.match(pattern, title):
+        if re.match(pattern, title, re.IGNORECASE):
             reasons.append("Generic placeholder title")
             break
 
@@ -81,19 +80,17 @@ def is_broken_title(title, author, filename, local_patterns=None):
         reasons.append("All CAPS - formatting error")
 
     # DEFINITELY BROKEN: Titles that look like file formats/extensions
-    if re.search(r"\.(pdf|dvi|tex|indd)$", title.lower()):
+    if re.search(r"\.(pdf|dvi|tex|indd|docx?|pptx?)$", title.lower()):
         reasons.append("Contains file extension")
 
     # DEFINITELY BROKEN: Very short ambiguous titles
     very_short_ambiguous = [
-        r"^IR_draft$",
-        r"^SVMs$",
-        r"^Dropout$",
-        r"^backprop$",
         r"^Lecture \d+$",
+        r"^Slide \d+$",
+        r"^Chapter \d+$",
     ]
     for pattern in very_short_ambiguous:
-        if re.match(pattern, title):
+        if re.match(pattern, title, re.IGNORECASE):
             reasons.append("Very short/broken title")
             break
 
@@ -101,11 +98,15 @@ def is_broken_title(title, author, filename, local_patterns=None):
     if re.match(r"^(PII:|DOI:)", title):
         reasons.append("PII/DOI code as title")
 
-    # PROBABLY BROKEN: Metadata artifacts
+    # PROBABLY BROKEN: Metadata artifacts left by authoring tools.
+    # Keep these generic (tool signatures, not subject matter) -- patterns
+    # specific to one collection belong in local_title_patterns.json.
     broken_metadata = [
+        r"^Microsoft Word - ",
+        r"^Microsoft PowerPoint - ",
         r"Combined DVI Document",
-        r"Conference Proceedings Document$",
-        r"Voice User Interface Document$",
+        r"^Adobe (Acrobat|InDesign)",
+        r"^print(job|out)?$",
     ]
     for pattern in broken_metadata:
         if re.search(pattern, title, re.IGNORECASE):
