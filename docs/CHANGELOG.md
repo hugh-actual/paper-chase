@@ -1,6 +1,34 @@
 # Documentation Update Summary
 
-**Last Updated**: 2026-07-19
+**Last Updated**: 2026-07-24
+
+---
+
+## Ingest Conflict Detection Fix (2026-07-24)
+
+- Fixed byte-identical duplicates being silently ingested when they arrived in
+  the same `todo/` batch. `DocumentProcessor` loaded the existing references
+  once and never updated them mid-run, so `check_hash_conflict` only ever saw
+  pre-run state and the second copy entered the library under a `_2` suffix.
+  Duplicates in a *later* batch were already caught correctly
+- Conflict detection is now explicitly hash-based, not filename-based: a
+  byte-identical file is always held in `todo/` (same batch or not), while a
+  distinct file that merely generates the same name is ingested and suffixed
+- Target filenames are now reserved against `references.json` as well as the
+  current batch and `reference/`, so an orphaned entry (in JSON, missing on
+  disk) can no longer have its filename reused
+- `DocumentProcessor` now loads references once, mutates in memory, and saves
+  once per run — matching the pattern `UpdateStep` already used, and removing a
+  full JSON rewrite per ingested file
+- `todo/` is scanned in sorted order, so when two files collide on name the
+  alphabetically-first one deterministically keeps the unsuffixed name
+- Added `build_reference_entry()` to `utils.py`, shared by
+  `add_entry_to_references_json` and the in-memory path so both produce
+  identically-shaped entries
+- Added multi-file `DocumentProcessor` integration tests, which did not exist
+  before: within-batch duplicate (asserting a rejected file does not consume a
+  suffix slot), name collision with distinct content, deterministic ordering,
+  and orphaned-entry filename reservation (131 tests total)
 
 ---
 
@@ -19,6 +47,19 @@
 - `UpdateStep` loads/saves references.json once per run; files are renamed
   before metadata is updated
 - Documentation brought in line with the actual repo layout and Python 3.11
+
+---
+
+## Refactoring Update (2026-01-11)
+
+- Migrate scripts to github
+
+---
+
+## Refactoring Update (2026-01-04)
+
+- More/better tests
+- Add linting and formatting
 
 ---
 
@@ -66,25 +107,10 @@ uv run pytest tests/ -v
 
 - Shared utils module
 - Deleted some obsolete scripts
-- Updated CLAUDE.md
 - Better documentation
 
 
 | File | Purpose | Status |
 |------|---------|--------|
-| `CLAUDE.md` | Main reference guide | Updated 2025-12-30 |
 | `UV_SETUP.md` | uv installation guide | Current |
 | `CHANGELOG.md` | This changelog | Updated 2025-12-30 |
-
----
-
-## Refactoring Update (2026-01-04)
-
-- More/better tests
-- Add linting and formatting
-
----
-
-## Refactoring Update (2026-01-11)
-
-- Migrate scripts to github

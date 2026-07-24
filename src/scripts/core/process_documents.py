@@ -19,9 +19,10 @@ from src.lib import config
 
 # Import shared utilities
 from src.lib.utils import (
-    add_entry_to_references_json,
+    build_reference_entry,
     regenerate_references_md,
     load_references_json,
+    save_references_json,
     create_reference_stub,
     check_hash_conflict,
     check_filename_conflict,
@@ -134,8 +135,13 @@ class DocumentProcessor:
             year = metadata.get("year") or filename_info.get("year") or "n.d."
             publisher = metadata.get("publisher")
 
-            # Create reference stub with hash and filename before processing
-            processed_filenames = {p["new_filename"] for p in self.processed_files}
+            # Create reference stub with hash and filename before processing.
+            # Reserve names against both this batch's processed files and
+            # references.json (including orphaned entries with no file on
+            # disk), so a suffix is never reused.
+            processed_filenames = {p["new_filename"] for p in self.processed_files} | {
+                e["filename"] for e in self.existing_references
+            }
             stub = create_reference_stub(
                 file_path=file_path,
                 author=author,
@@ -204,15 +210,20 @@ class DocumentProcessor:
             dest_path = config.REFERENCE_DIR / new_filename
             shutil.move(str(file_path), str(dest_path))
 
-            # Add to references JSON with file hash
-            add_entry_to_references_json(
-                stub["author_names"],
-                stub["year"],
-                stub["title"],
-                stub["publisher"],
-                new_filename,
-                original_filename=file_path.name,
-                file_hash=stub["file_hash"],
+            # Append to the in-memory references list (saved once at the end
+            # of run()) so later files in this batch see it immediately via
+            # self.existing_references, closing the within-batch duplicate
+            # window.
+            self.existing_references.append(
+                build_reference_entry(
+                    stub["author_names"],
+                    stub["year"],
+                    stub["title"],
+                    stub["publisher"],
+                    new_filename,
+                    original_filename=file_path.name,
+                    file_hash=stub["file_hash"],
+                )
             )
 
             # Record processing
@@ -242,8 +253,10 @@ class DocumentProcessor:
         self.existing_references = load_references_json()
         print(f"  Found {len(self.existing_references)} existing entries")
 
-        # Scan files
-        all_files = list(config.TODO_DIR.glob("*"))
+        # Scan files (sorted for deterministic ingest order: when two files
+        # would collide on filename, the alphabetically-first one wins the
+        # clean name)
+        all_files = sorted(config.TODO_DIR.glob("*"))
         pdf_files = [f for f in all_files if f.suffix.lower() == ".pdf"]
         non_pdf_files = [
             f for f in all_files if f.suffix.lower() != ".pdf" and f.is_file()
@@ -282,8 +295,10 @@ class DocumentProcessor:
             if i % 50 == 0:
                 print(f"  ... {i} files processed")
 
-        # Generate references.md from references.json
+        # Save references.json once, then generate references.md from it
         if self.processed_files:
+            print("Saving references.json...")
+            save_references_json(self.existing_references)
             print("Generating references.md from JSON...")
             if regenerate_references_md():
                 print("  ✓ References.md generated successfully")

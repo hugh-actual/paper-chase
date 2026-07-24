@@ -182,7 +182,7 @@ make format
 make lint
 ```
 
-122 tests covering all core utilities plus integration tests for the processing and update pipelines.
+131 tests covering all core utilities plus integration tests for the processing and update pipelines.
 
 ## All Available Commands
 
@@ -211,7 +211,7 @@ Need fine-grained control? Run `make help` to see all commands:
 A: Run `make status` - it will tell you exactly what needs attention and recommend next steps.
 
 **Q: Files remain in `todo/` after running `make ingest`**
-A: Check `json-output/ingestion_conflicts.json` - these files likely have hash conflicts or filename collisions with existing entries.
+A: Check `json-output/ingestion_conflicts.json` - these files likely have hash conflicts or filename collisions with existing entries. Conflict detection is hash-based, not filename-based: a byte-identical duplicate is always held in `todo/`, even if it arrived in the same batch as its first copy, while a distinct file that merely shares a generated name is ingested and suffixed (`_2`, `_3`, ...). There is no automatic resolution step for a held duplicate - once you've confirmed it's really unwanted, delete it from `todo/` (or move it elsewhere) yourself.
 
 **Q: How do I find and fix duplicates?**
 A: Run `make detect-all` to find all duplicates, then `make status` to see how many were found. Review the JSON files in `json-output/`, then run `make update-all` to apply your decisions.

@@ -220,6 +220,39 @@ def save_references_json(entries):
         json.dump(entries, f, indent=2, ensure_ascii=False)
 
 
+def build_reference_entry(
+    author_names,
+    year,
+    title,
+    publisher,
+    filename,
+    original_filename=None,
+    file_hash=None,
+):
+    """
+    Build a references.json entry dict from raw fields.
+
+    Shared by add_entry_to_references_json (which loads/saves the JSON file
+    itself) and callers that maintain their own in-memory copy of the
+    references list across a batch (e.g. DocumentProcessor), so both paths
+    produce identically-shaped entries.
+    """
+    entry = {
+        "author": (
+            ", ".join(author_names) if isinstance(author_names, list) else author_names
+        ),
+        "year": year or "",
+        "title": title,
+        "publisher": publisher or "",
+        "filename": filename,
+    }
+    if original_filename:
+        entry["original_filename"] = original_filename
+    if file_hash:
+        entry["file_hash"] = file_hash
+    return entry
+
+
 def add_entry_to_references_json(
     author_names,
     year,
@@ -259,21 +292,15 @@ def add_entry_to_references_json(
             return True
 
     # Add new entry
-    new_entry = {
-        "author": (
-            ", ".join(author_names) if isinstance(author_names, list) else author_names
-        ),
-        "year": year or "",
-        "title": title,
-        "publisher": publisher or "",
-        "filename": filename,
-    }
-    # Add original_filename if provided
-    if original_filename:
-        new_entry["original_filename"] = original_filename
-    # Add file_hash if provided
-    if file_hash:
-        new_entry["file_hash"] = file_hash
+    new_entry = build_reference_entry(
+        author_names,
+        year,
+        title,
+        publisher,
+        filename,
+        original_filename=original_filename,
+        file_hash=file_hash,
+    )
     entries.append(new_entry)
     save_references_json(entries)
     return True
