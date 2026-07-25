@@ -2,7 +2,7 @@
 name = "paper-chase"
 version = "0.1.0"
 description = "simple python scripts to organise a pdf collection"
-requires-python = ">=3.11"
+requires-python = ">=3.14"
 dependencies = [
     "pypdf>=4.0",
     "python-dotenv>=1.0.0",
