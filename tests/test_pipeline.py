@@ -227,6 +227,26 @@ class TestUpdateStep:
         assert result["update_errors"] == 1
         assert result["fatal_errors"] == 1
 
+    def test_failed_md_regeneration_is_fatal(self, sandbox, monkeypatch):
+        """references.json is already saved by the time references.md is
+        regenerated, so a failure there leaves the two out of sync --
+        and `verify` won't catch it, because it compares the filesystem
+        against references.json and never reads references.md."""
+        entry = seed_entry(sandbox, "Doe_Real.pdf", "Jane Doe", "Real", content=b"a")
+        utils.save_references_json([entry])
+
+        annotations = [{"filename": entry["filename"], "quarantine": True}]
+        input_file = sandbox["json_output"] / SimpleStep.input_filename
+        input_file.write_text(json.dumps(annotations))
+
+        monkeypatch.setattr("src.lib.steps.regenerate_references_md", lambda: False)
+
+        result = SimpleStep().run()
+
+        assert result["quarantined"] == 1
+        assert result["quarantine_errors"] == 0
+        assert result["fatal_errors"] == 1
+
 
 class TestDocumentProcessor:
     def test_hash_conflict_keeps_file_in_todo_and_writes_report(self, sandbox):

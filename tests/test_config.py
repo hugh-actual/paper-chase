@@ -2,6 +2,7 @@
 
 import importlib
 import os
+from pathlib import Path
 
 import src.lib.config as config
 
@@ -55,7 +56,10 @@ class TestExpandUser:
         ) as reloaded:
             assert str(reloaded.DOCS_BASE_DIR) == str(tmp_path / "documents")
             assert str(reloaded.PROCESSOR_DIR) == str(tmp_path / "paper-chase")
-            assert not (tmp_path / "~").exists()
+            # An unexpanded "~/..." is a *relative* path, so mkdir lands it
+            # under the CWD (the repo root), not under HOME -- that stray
+            # directory is the symptom B1 exists to prevent.
+            assert not (Path.cwd() / "~").exists()
 
     def test_derived_vars_with_literal_tilde_are_expanded(self, tmp_path):
         """Like `.env.example`, a derived var can carry its own literal
@@ -78,4 +82,7 @@ class TestExpandUser:
             assert str(reloaded.JSON_OUTPUT_DIR) == str(
                 tmp_path / "documents" / "json-output"
             )
-            assert not (tmp_path / "~").exists()
+            # An unexpanded "~/..." is a *relative* path, so mkdir lands it
+            # under the CWD (the repo root), not under HOME -- that stray
+            # directory is the symptom B1 exists to prevent.
+            assert not (Path.cwd() / "~").exists()

@@ -134,6 +134,10 @@ class UpdateStep(ABC):
                 print("  ✓ references.md generated\n")
             else:
                 print("  ⚠ Warning: generate_references_md.py failed\n")
+                # references.json now describes changes references.md doesn't
+                # reflect, and `verify` compares the filesystem against the
+                # JSON only -- so nothing downstream would catch this.
+                self.fatal_errors.append("Failed to regenerate references.md")
 
         # Phase 4: Summary and log
         self._print_summary(len(all_entries))
