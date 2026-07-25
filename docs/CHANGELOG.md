@@ -1,6 +1,37 @@
 # Documentation Update Summary
 
-**Last Updated**: 2026-07-24
+**Last Updated**: 2026-07-25
+
+---
+
+## Config Expansion and Exit Codes (2026-07-25)
+
+- `config.py` now expands `~` on every path it reads. dotenv interpolates
+  `${DOCS_BASE_DIR}/reference` into a literal string before `Path()` ever sees it,
+  so the derived vars inherit whatever `~` the base var held — expanding only the
+  two base vars would not have been enough. Copying `.env.example` verbatim and
+  following the README used to create a literal `~` directory in the working
+  directory, silently, because config mkdirs its directories on import
+- The eight near-identical `Path(os.getenv(...)).expanduser()` blocks collapse into
+  one `_env_path()` helper, which also normalises the `str`/`Path` mix in their
+  defaults
+- Update scripts now exit nonzero on genuine failures — an exception while
+  quarantining, a rename that raised, or `references.md` failing to regenerate — so
+  `make update-all` halts instead of running the full chain and echoing success over
+  the top of the errors. A failed `references.md` regeneration matters because it
+  happens *after* references.json is saved: the two end up out of sync, and `verify`
+  compares the filesystem against the JSON without ever reading references.md
+- Routine "file not found" / "not in references.json" outcomes stay non-fatal and
+  exit 0. Rerunning an update over stale annotations is normal, and the chain has to
+  keep working through it
+- Step errors are recorded as one list of `StepError(phase, filename, message,
+  fatal)` records rather than three parallel lists that could drift. The summary and
+  the markdown log now split into **Failures** and **Skipped**, and each step ends on
+  a status line reporting which it got — the detail scrolls off on a long run
+- `UpdateStep.run_as_main()` replaces the exit-code epilogue that was copy-pasted
+  into all four update scripts
+- Added tests for the four `main()` call sites, the `~`-expansion of both base and
+  derived vars, and the Failures/Skipped split (153 → 171 tests)
 
 ---
 
