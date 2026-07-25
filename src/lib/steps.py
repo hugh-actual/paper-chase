@@ -57,6 +57,12 @@ class UpdateStep(ABC):
         self.update_error_files = set()
         self.processed_files = set()
 
+        # Fatal errors are genuine failures (exceptions, rename failures).
+        # Everything else in *_errors above is a "not found" / "already
+        # applied" skip, which is routine on reruns over stale annotations
+        # and must not halt `make update-all`.
+        self.fatal_errors = []
+
         # Loaded once in run(), mutated in memory, saved once at the end
         self.references = []
 
@@ -139,6 +145,7 @@ class UpdateStep(ABC):
             "updated": self.updated,
             "quarantine_errors": len(self.quarantine_errors),
             "update_errors": len(self.update_errors),
+            "fatal_errors": len(self.fatal_errors),
         }
 
     def _process_quarantine(self, entries: list[dict]) -> None:
@@ -177,6 +184,7 @@ class UpdateStep(ABC):
                 print(f"    [!] Error: {e}")
                 self.quarantine_errors.append(f"{filename}: {e}")
                 self.quarantine_error_files.add(filename)
+                self.fatal_errors.append(f"{filename}: {e}")
 
     def _process_updates(self, entries: list[dict]) -> None:
         """
@@ -265,6 +273,7 @@ class UpdateStep(ABC):
                     print(f"    [!] Error renaming file: {e}")
                     self.update_errors.append(f"Error renaming {filename}: {e}")
                     self.update_error_files.add(filename)
+                    self.fatal_errors.append(f"Error renaming {filename}: {e}")
                     continue
             else:
                 print("    ✓ Metadata updated (filename unchanged)")

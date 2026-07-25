@@ -27,8 +27,9 @@ class UpdateUnknownAuthors(UpdateStep):
 def main():
     """Main entry point."""
     step = UpdateUnknownAuthors()
-    step.run()
+    result = step.run()
+    return 1 if result["fatal_errors"] else 0
 
 
 if __name__ == "__main__":
-    main()
+    exit(main())

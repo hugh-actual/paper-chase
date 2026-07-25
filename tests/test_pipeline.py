@@ -184,6 +184,49 @@ class TestUpdateStep:
         assert "Missing_File.pdf" not in quarantined_section
         assert entry["filename"] in quarantined_section
 
+    def test_missing_file_is_non_fatal(self, sandbox):
+        """A 'file not found' error is routine on reruns over stale
+        annotations (already applied, or overlapping with another update
+        step) and must not be treated as a fatal failure."""
+        annotations = [{"filename": "Already_Handled.pdf", "quarantine": True}]
+        input_file = sandbox["json_output"] / SimpleStep.input_filename
+        input_file.write_text(json.dumps(annotations))
+        utils.save_references_json([])
+
+        result = SimpleStep().run()
+
+        assert result["quarantine_errors"] == 1
+        assert result["fatal_errors"] == 0
+
+    def test_rename_failure_is_fatal(self, sandbox, monkeypatch):
+        """A genuine failure while applying an update (e.g. the rename
+        itself raising) must be reported as fatal, unlike a routine
+        'not found' skip."""
+        entry = seed_entry(sandbox, "Doe_Real.pdf", "Jane Doe", "Real", content=b"a")
+        utils.save_references_json([entry])
+
+        annotations = [
+            {
+                "filename": entry["filename"],
+                "quarantine": None,
+                "suggested_author": None,
+                "suggested_title": "New Title",
+                "suggested_year": None,
+            }
+        ]
+        input_file = sandbox["json_output"] / SimpleStep.input_filename
+        input_file.write_text(json.dumps(annotations))
+
+        def boom(old_path, new_path):
+            raise OSError("simulated rename failure")
+
+        monkeypatch.setattr("src.lib.steps.rename_file", boom)
+
+        result = SimpleStep().run()
+
+        assert result["update_errors"] == 1
+        assert result["fatal_errors"] == 1
+
 
 class TestDocumentProcessor:
     def test_hash_conflict_keeps_file_in_todo_and_writes_report(self, sandbox):
