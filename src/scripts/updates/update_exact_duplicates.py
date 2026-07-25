@@ -35,9 +35,7 @@ class UpdateExactDuplicates(UpdateStep):
 
 def main():
     """Main entry point."""
-    step = UpdateExactDuplicates()
-    result = step.run()
-    return 1 if result["fatal_errors"] else 0
+    return UpdateExactDuplicates.run_as_main()
 
 
 if __name__ == "__main__":

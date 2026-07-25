@@ -29,9 +29,7 @@ class UpdateBrokenTitles(UpdateStep):
 
 def main():
     """Main entry point."""
-    step = UpdateBrokenTitles()
-    result = step.run()
-    return 1 if result["fatal_errors"] else 0
+    return UpdateBrokenTitles.run_as_main()
 
 
 if __name__ == "__main__":

@@ -30,9 +30,7 @@ class UpdateSimilarPairs(UpdateStep):
 
 def main():
     """Main entry point."""
-    step = UpdateSimilarPairs()
-    result = step.run()
-    return 1 if result["fatal_errors"] else 0
+    return UpdateSimilarPairs.run_as_main()
 
 
 if __name__ == "__main__":
