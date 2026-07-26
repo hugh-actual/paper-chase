@@ -30,9 +30,8 @@ class UpdateSimilarPairs(UpdateStep):
 
 def main():
     """Main entry point."""
-    step = UpdateSimilarPairs()
-    step.run()
+    return UpdateSimilarPairs.run_as_main()
 
 
 if __name__ == "__main__":
-    main()
+    exit(main())

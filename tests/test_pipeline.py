@@ -5,6 +5,7 @@ touches the real collection.
 """
 
 import hashlib
+import importlib
 import io
 import json
 from pathlib import Path
@@ -183,6 +184,140 @@ class TestUpdateStep:
         quarantined_section = log.split("## Quarantined Files")[1].split("##")[0]
         assert "Missing_File.pdf" not in quarantined_section
         assert entry["filename"] in quarantined_section
+
+    def test_missing_file_is_non_fatal(self, sandbox):
+        """A 'file not found' error is routine on reruns over stale
+        annotations (already applied, or overlapping with another update
+        step) and must not be treated as a fatal failure."""
+        annotations = [{"filename": "Already_Handled.pdf", "quarantine": True}]
+        input_file = sandbox["json_output"] / SimpleStep.input_filename
+        input_file.write_text(json.dumps(annotations))
+        utils.save_references_json([])
+
+        result = SimpleStep().run()
+
+        assert result["quarantine_errors"] == 1
+        assert result["fatal_errors"] == 0
+
+    def test_rename_failure_is_fatal(self, sandbox, monkeypatch):
+        """A genuine failure while applying an update (e.g. the rename
+        itself raising) must be reported as fatal, unlike a routine
+        'not found' skip."""
+        entry = seed_entry(sandbox, "Doe_Real.pdf", "Jane Doe", "Real", content=b"a")
+        utils.save_references_json([entry])
+
+        annotations = [
+            {
+                "filename": entry["filename"],
+                "quarantine": None,
+                "suggested_author": None,
+                "suggested_title": "New Title",
+                "suggested_year": None,
+            }
+        ]
+        input_file = sandbox["json_output"] / SimpleStep.input_filename
+        input_file.write_text(json.dumps(annotations))
+
+        def boom(old_path, new_path):
+            raise OSError("simulated rename failure")
+
+        monkeypatch.setattr("src.lib.steps.rename_file", boom)
+
+        result = SimpleStep().run()
+
+        assert result["update_errors"] == 1
+        assert result["fatal_errors"] == 1
+
+    def test_failed_md_regeneration_is_fatal(self, sandbox, monkeypatch):
+        """references.json is already saved by the time references.md is
+        regenerated, so a failure there leaves the two out of sync --
+        and `verify` won't catch it, because it compares the filesystem
+        against references.json and never reads references.md."""
+        entry = seed_entry(sandbox, "Doe_Real.pdf", "Jane Doe", "Real", content=b"a")
+        utils.save_references_json([entry])
+
+        annotations = [{"filename": entry["filename"], "quarantine": True}]
+        input_file = sandbox["json_output"] / SimpleStep.input_filename
+        input_file.write_text(json.dumps(annotations))
+
+        monkeypatch.setattr("src.lib.steps.regenerate_references_md", lambda: False)
+
+        result = SimpleStep().run()
+
+        assert result["quarantined"] == 1
+        assert result["quarantine_errors"] == 0
+        assert result["fatal_errors"] == 1
+
+    def test_log_separates_failures_from_skips(self, sandbox, monkeypatch):
+        """The log must let a reader tell a genuine failure from an
+        'already applied' skip -- the printed detail scrolls off, so the
+        log is where a partially-applied run gets diagnosed."""
+        entry = seed_entry(sandbox, "Doe_Real.pdf", "Jane Doe", "Real", content=b"a")
+        utils.save_references_json([entry])
+
+        annotations = [
+            # Genuine failure: the rename raises.
+            {"filename": entry["filename"], "suggested_title": "New Title"},
+            # Routine skip: annotation left over from an earlier run.
+            {"filename": "Already_Handled.pdf", "quarantine": True},
+        ]
+        input_file = sandbox["json_output"] / SimpleStep.input_filename
+        input_file.write_text(json.dumps(annotations))
+
+        def boom(old_path, new_path):
+            raise OSError("simulated rename failure")
+
+        monkeypatch.setattr("src.lib.steps.rename_file", boom)
+
+        step = SimpleStep()
+        result = step.run()
+
+        assert result["fatal_errors"] == 1
+        log = step.log_file.read_text()
+        failures = log.split("## Failures")[1].split("## Skipped")[0]
+        skipped = log.split("## Skipped")[1]
+
+        assert "simulated rename failure" in failures
+        assert "Already_Handled.pdf" not in failures
+        assert "Already_Handled.pdf" in skipped
+        assert "simulated rename failure" not in skipped
+
+
+UPDATE_MODULES = [
+    "src.scripts.updates.update_broken_titles",
+    "src.scripts.updates.update_unknown_authors",
+    "src.scripts.updates.update_exact_duplicates",
+    "src.scripts.updates.update_similar_pairs",
+]
+
+
+class TestMainExitCodes:
+    """Each update script's main() must translate fatal errors into an
+    exit code, so `make update-all` halts on real breakage. The steps.py
+    branch is covered above; this covers the four call sites."""
+
+    @pytest.mark.parametrize("module_path", UPDATE_MODULES)
+    @pytest.mark.parametrize("fatal_count, expected_exit", [(0, 0), (1, 1), (3, 1)])
+    def test_main_returns_exit_code(
+        self, sandbox, monkeypatch, module_path, fatal_count, expected_exit
+    ):
+        module = importlib.import_module(module_path)
+
+        # No subclass overrides run(), so patching the base covers all four.
+        monkeypatch.setattr(
+            UpdateStep,
+            "run",
+            lambda self: {
+                "total": 0,
+                "quarantined": 0,
+                "updated": 0,
+                "quarantine_errors": 0,
+                "update_errors": 0,
+                "fatal_errors": fatal_count,
+            },
+        )
+
+        assert module.main() == expected_exit
 
 
 class TestDocumentProcessor:

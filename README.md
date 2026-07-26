@@ -20,22 +20,38 @@ A Python-based tool for organizing and managing your academic PDF library. Autom
 ### Prerequisites
 
 - Python 3.11+
-- `uv` package manager (installed at `~/.local/bin/uv`)
+- `uv` package manager
 - `make` (standard on macOS/Linux)
 
 ### Setup
 
 1. **Configure your environment**:
    ```bash
-   cd ~/{git_folder}/paper-chase
+   cd ~/paper-chase
    cp .env.example .env
    nano .env  # Edit paths as needed
    ```
 
-2. **Verify installation**:
+   `.env.example` ships `~`-relative paths (`~/documents`, `~/paper-chase`); point
+   them wherever you keep your library. Every `make` target reads these, so getting
+   them right here is the whole of the configuration.
+
+2. **Install dependencies**:
    ```bash
-   make verify
+   uv sync
    ```
+
+   Every `make` target runs through `uv run`, which bootstraps the environment on
+   first use — so this step mainly gets the wait over with up front, and surfaces a
+   broken Python or `uv` install immediately rather than mid-workflow.
+
+3. **Check the install**:
+   ```bash
+   make test
+   ```
+
+   Note that `make verify` checks your *collection*, not your installation — on a
+   fresh, empty library it prints an all-clear regardless of whether anything works.
 
 ### Essential Commands
 
@@ -54,7 +70,7 @@ make update-all     # Apply all fixes and verify
 
 ### 1. Processing New PDFs
 
-1. **Add PDFs** to `~/{docs_folder}/todo/`
+1. **Add PDFs** to the `todo/` directory inside your configured `DOCS_BASE_DIR`
 
 2. **Run the ingest pipeline**:
    ```bash
@@ -91,6 +107,12 @@ make update-all     # Apply all fixes and verify
    make update-all
    ```
    Applies all your annotations and verifies the collection.
+
+   Each `update-*` step exits nonzero on a genuine failure — a file that could not
+   be renamed or moved — which halts the chain instead of running to the end and
+   reporting success. Entries it simply had nothing to do for (already applied on an
+   earlier run, or annotated in two files at once) are reported as **Skipped**, not
+   failures, so reruns are harmless. The last line of each step says which you got.
 
 ### 3. Check Collection Health
 
@@ -131,7 +153,7 @@ Run `make help` to see all available commands.
 ## File Organization
 
 ```
-~/{docs_folder}/
+<DOCS_BASE_DIR>/          # whatever you set in .env
 ├── reference/        # Your organized PDF library
 ├── quarantine/       # Duplicates and removed files
 ├── todo/             # New PDFs to process
@@ -182,7 +204,7 @@ make format
 make lint
 ```
 
-131 tests covering all core utilities plus integration tests for the processing and update pipelines.
+171 tests covering all core utilities plus integration tests for the processing and update pipelines.
 
 ## All Available Commands
 

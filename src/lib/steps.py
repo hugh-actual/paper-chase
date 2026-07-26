@@ -9,6 +9,7 @@ that is shared across all update scripts.
 
 import shutil
 from abc import ABC, abstractmethod
+from dataclasses import dataclass
 
 from src.lib import config
 from src.lib.utils import (
@@ -18,6 +19,24 @@ from src.lib.utils import (
     save_references_json,
     regenerate_references_md,
 )
+
+
+@dataclass(frozen=True)
+class StepError:
+    """One thing that went wrong during a step.
+
+    `fatal` is the distinction that matters: a fatal error is a genuine
+    failure (an exception, a rename that raised, references.md failing to
+    regenerate) and makes the script exit nonzero. Everything else is a
+    "file not found" / "not in references.json" skip, which is routine
+    when rerunning over stale annotations -- those stay non-fatal so
+    `make update-all` keeps chaining through harmless reruns.
+    """
+
+    phase: str  # "quarantine" | "update" | "output"
+    filename: str  # "" for run-level failures with no single file
+    message: str
+    fatal: bool
 
 
 class UpdateStep(ABC):
@@ -51,14 +70,56 @@ class UpdateStep(ABC):
         # Result tracking
         self.quarantined = 0
         self.updated = 0
-        self.quarantine_errors = []
-        self.update_errors = []
-        self.quarantine_error_files = set()
-        self.update_error_files = set()
         self.processed_files = set()
+
+        # Single record of everything that went wrong. The per-phase and
+        # fatal views below are derived from it, so they cannot drift.
+        self.errors: list[StepError] = []
 
         # Loaded once in run(), mutated in memory, saved once at the end
         self.references = []
+
+    def _record_error(
+        self, phase: str, filename: str, message: str, fatal: bool = False
+    ) -> None:
+        """Record a failure or a skip. See StepError for the distinction."""
+        self.errors.append(StepError(phase, filename, message, fatal))
+
+    def _errors_in(self, phase: str) -> list[StepError]:
+        return [e for e in self.errors if e.phase == phase]
+
+    @property
+    def quarantine_errors(self) -> list[StepError]:
+        return self._errors_in("quarantine")
+
+    @property
+    def update_errors(self) -> list[StepError]:
+        return self._errors_in("update")
+
+    @property
+    def fatal_errors(self) -> list[StepError]:
+        return [e for e in self.errors if e.fatal]
+
+    @property
+    def skipped_errors(self) -> list[StepError]:
+        return [e for e in self.errors if not e.fatal]
+
+    @property
+    def quarantine_error_files(self) -> set:
+        return {e.filename for e in self.quarantine_errors}
+
+    @property
+    def update_error_files(self) -> set:
+        return {e.filename for e in self.update_errors}
+
+    @classmethod
+    def run_as_main(cls) -> int:
+        """Entry point for `python -m`: nonzero only on genuine failures.
+
+        Routine skips still exit 0, so `make update-all` keeps chaining
+        through reruns over stale annotations.
+        """
+        return 1 if cls().run()["fatal_errors"] else 0
 
     @abstractmethod
     def load_entries(self) -> list[dict]:
@@ -128,6 +189,12 @@ class UpdateStep(ABC):
                 print("  ✓ references.md generated\n")
             else:
                 print("  ⚠ Warning: generate_references_md.py failed\n")
+                # references.json now describes changes references.md doesn't
+                # reflect, and `verify` compares the filesystem against the
+                # JSON only -- so nothing downstream would catch this.
+                self._record_error(
+                    "output", "", "Failed to regenerate references.md", fatal=True
+                )
 
         # Phase 4: Summary and log
         self._print_summary(len(all_entries))
@@ -139,6 +206,7 @@ class UpdateStep(ABC):
             "updated": self.updated,
             "quarantine_errors": len(self.quarantine_errors),
             "update_errors": len(self.update_errors),
+            "fatal_errors": len(self.fatal_errors),
         }
 
     def _process_quarantine(self, entries: list[dict]) -> None:
@@ -152,8 +220,7 @@ class UpdateStep(ABC):
 
             if not old_path.exists():
                 print(f"    [!] File not found: {filename}")
-                self.quarantine_errors.append(f"File not found: {filename}")
-                self.quarantine_error_files.add(filename)
+                self._record_error("quarantine", filename, "File not found")
                 continue
 
             try:
@@ -168,15 +235,13 @@ class UpdateStep(ABC):
                     print("    ✓ Moved to quarantine/")
                 else:
                     print("    [!] Warning: Entry not found in references.json")
-                    self.quarantine_errors.append(
-                        f"Entry not in references.json: {filename}"
+                    self._record_error(
+                        "quarantine", filename, "Entry not in references.json"
                     )
-                    self.quarantine_error_files.add(filename)
 
             except Exception as e:
                 print(f"    [!] Error: {e}")
-                self.quarantine_errors.append(f"{filename}: {e}")
-                self.quarantine_error_files.add(filename)
+                self._record_error("quarantine", filename, str(e), fatal=True)
 
     def _process_updates(self, entries: list[dict]) -> None:
         """
@@ -196,8 +261,7 @@ class UpdateStep(ABC):
 
             if not current_entry:
                 print(f"  [!] File not found in references.json: {filename}")
-                self.update_errors.append(f"Not in references.json: {filename}")
-                self.update_error_files.add(filename)
+                self._record_error("update", filename, "Not in references.json")
                 continue
 
             current_author = current_entry.get("author", "")
@@ -246,8 +310,7 @@ class UpdateStep(ABC):
             old_path = config.REFERENCE_DIR / filename
             if not old_path.exists():
                 print(f"    [!] File not found: {filename}")
-                self.update_errors.append(f"File not found: {filename}")
-                self.update_error_files.add(filename)
+                self._record_error("update", filename, "File not found")
                 continue
 
             # Generate new filename
@@ -263,8 +326,9 @@ class UpdateStep(ABC):
                     print(f"    ✓ Renamed to: {new_filename}")
                 except Exception as e:
                     print(f"    [!] Error renaming file: {e}")
-                    self.update_errors.append(f"Error renaming {filename}: {e}")
-                    self.update_error_files.add(filename)
+                    self._record_error(
+                        "update", filename, f"Error renaming: {e}", fatal=True
+                    )
                     continue
             else:
                 print("    ✓ Metadata updated (filename unchanged)")
@@ -284,6 +348,12 @@ class UpdateStep(ABC):
             self.processed_files.add(new_filename)
             self.updated += 1
 
+    @staticmethod
+    def _describe(err: StepError) -> str:
+        """One-line rendering of an error, including which phase it came from."""
+        where = f"{err.phase}/{err.filename}" if err.filename else err.phase
+        return f"[{where}] {err.message}"
+
     def _print_summary(self, total: int) -> None:
         """Print summary to stdout."""
         print("=" * 70)
@@ -292,18 +362,18 @@ class UpdateStep(ABC):
         print(f"Total files processed: {total}")
         print(f"Files quarantined: {self.quarantined}")
         print(f"Files updated: {self.updated}")
-        print(f"Quarantine errors: {len(self.quarantine_errors)}")
-        print(f"Update errors: {len(self.update_errors)}")
+        print(f"Failures: {len(self.fatal_errors)}")
+        print(f"Skipped (already applied): {len(self.skipped_errors)}")
 
-        if self.quarantine_errors:
-            print("\nQuarantine errors:")
-            for err in self.quarantine_errors:
-                print(f"  - {err}")
+        if self.fatal_errors:
+            print("\nFailures:")
+            for err in self.fatal_errors:
+                print(f"  - {self._describe(err)}")
 
-        if self.update_errors:
-            print("\nUpdate errors:")
-            for err in self.update_errors:
-                print(f"  - {err}")
+        if self.skipped_errors:
+            print("\nSkipped (nothing to do -- already applied, or not present):")
+            for err in self.skipped_errors:
+                print(f"  - {self._describe(err)}")
 
     def _write_log(
         self,
@@ -318,8 +388,8 @@ class UpdateStep(ABC):
             f.write(f"- **Total files processed**: {len(all_entries)}\n")
             f.write(f"- **Files quarantined**: {self.quarantined}\n")
             f.write(f"- **Files updated**: {self.updated}\n")
-            f.write(f"- **Quarantine errors**: {len(self.quarantine_errors)}\n")
-            f.write(f"- **Update errors**: {len(self.update_errors)}\n\n")
+            f.write(f"- **Failures**: {len(self.fatal_errors)}\n")
+            f.write(f"- **Skipped**: {len(self.skipped_errors)}\n\n")
 
             if self.quarantined > 0:
                 f.write("## Quarantined Files\n\n")
@@ -345,17 +415,27 @@ class UpdateStep(ABC):
                             f.write(f"- **{entry_name}**: {change_list}\n")
                 f.write("\n")
 
-            if self.quarantine_errors:
-                f.write("## Quarantine Errors\n\n")
-                for err in self.quarantine_errors:
-                    f.write(f"- {err}\n")
+            if self.fatal_errors:
+                f.write("## Failures\n\n")
+                for err in self.fatal_errors:
+                    f.write(f"- {self._describe(err)}\n")
                 f.write("\n")
 
-            if self.update_errors:
-                f.write("## Update Errors\n\n")
-                for err in self.update_errors:
-                    f.write(f"- {err}\n")
+            if self.skipped_errors:
+                f.write("## Skipped\n\n")
+                f.write("Nothing to do -- already applied, or not present.\n\n")
+                for err in self.skipped_errors:
+                    f.write(f"- {self._describe(err)}\n")
                 f.write("\n")
 
         print(f"\n✓ Log saved to: {self.log_file}")
+        # Last line on screen, deliberately: the detail above scrolls off, and
+        # a partially-applied run must not end on an unqualified success.
+        if self.fatal_errors:
+            print(
+                f"✗ {len(self.fatal_errors)} genuine failure(s) "
+                "-- this run did not fully apply."
+            )
+        else:
+            print("✓ Completed with no failures.")
         print("=" * 70)
