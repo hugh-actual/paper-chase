@@ -24,6 +24,7 @@ from src.lib.utils import (
     build_reference_entry,
     calculate_file_hash,
     regenerate_references_md,
+    load_history,
     load_references_json,
     save_references_json,
     create_reference_stub,
@@ -100,6 +101,7 @@ class DocumentProcessor:
         self.conflicts = []  # Track files with hash/filename conflicts
         self.relinked = []  # Files that restored an entry's missing file
         self.existing_references = None  # Pre-loaded references for conflict checking
+        self.history = []  # History journal, loaded once per run
         # references.json is saved after every file; only the first save of
         # the run backs up, so references.json.bak is the pre-run state.
         self._backed_up = False
@@ -370,6 +372,8 @@ class DocumentProcessor:
           (returned as relink_entry, no conflict);
         - name occupied by different content -> `hash_matches_missing_file`
           (held: restoring it would overwrite that other file).
+        With no live match, a hash that was quarantined before and is still
+        in quarantine/ is held as `previously_quarantined`.
         """
         conflicts = []
 
@@ -398,11 +402,58 @@ class DocumentProcessor:
                 }
             )
 
+        elif stub["file_hash"]:
+            conflict = self._check_previously_quarantined(stub["file_hash"])
+            if conflict:
+                conflicts.append(conflict)
+
         # No filename-collision check: create_reference_stub already
         # suffixes the name against every existing entry and this batch, so
         # a colliding name can't reach here.
 
         return conflicts, None
+
+    def _check_previously_quarantined(self, file_hash: str) -> Optional[dict]:
+        """A file with no live entry that was quarantined before.
+
+        Held as `previously_quarantined` while a quarantined copy with this
+        hash is still in quarantine/ -- re-ingesting it would silently undo
+        a deliberate decision. If every quarantined copy is gone or has
+        changed, there's nothing to protect: ingest it, with a warning.
+        """
+        events = [
+            e
+            for e in self.history
+            if e.get("event") in ("quarantine", "quarantine_held")
+            and e.get("file_hash") == file_hash
+        ]
+        for event in reversed(events):
+            name = event.get("quarantine_filename")
+            if not name:
+                continue
+            quarantined = config.QUARANTINE_DIR / name
+            if quarantined.exists() and calculate_file_hash(quarantined) == file_hash:
+                return {
+                    "type": "previously_quarantined",
+                    "quarantine_filename": name,
+                    "quarantined_at": event.get("ts"),
+                    "existing_filename": name,
+                    "existing_title": event.get("title", ""),
+                    "existing_file_present": True,
+                    "message": (
+                        f"File hash matches a file quarantined on "
+                        f"{event.get('ts')}: quarantine/{name}"
+                    ),
+                }
+
+        if events:
+            latest = events[-1]
+            self.log_entries.append(
+                f"Re-ingesting a file quarantined on {latest.get('ts')} "
+                f"(as quarantine/{latest.get('quarantine_filename')}); that "
+                "quarantined copy is gone or has changed"
+            )
+        return None
 
     def _relink(self, file_path: Path, entry: dict) -> None:
         """Move `file_path` to the missing file of `entry`, keeping the
@@ -448,6 +499,8 @@ class DocumentProcessor:
         print("Loading existing references...")
         self.existing_references = load_references_json()
         print(f"  Found {len(self.existing_references)} existing entries")
+        # Once per run, for the previously-quarantined check (missing -> [])
+        self.history = load_history()
 
         # Scan files (sorted for deterministic ingest order: when two files
         # would collide on filename, the alphabetically-first one wins the

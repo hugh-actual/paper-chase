@@ -1676,3 +1676,103 @@ class TestHeldConflicts:
         out = capsys.readouterr().out
         assert "make ingest" in out
         assert "make quarantine-held" in out
+
+
+class TestPreviouslyQuarantined:
+    CONTENT = b"%PDF-1.4 quarantined content\n%%EOF\n"
+
+    def _quarantine_event(self, sandbox, file_hash, copy=True):
+        if copy:
+            (sandbox["quarantine"] / "Smith_Dup.pdf").write_bytes(self.CONTENT)
+        write_history(
+            sandbox,
+            {
+                "event": "quarantine",
+                "ts": "2026-01-02T03:04:05+00:00",
+                "author": "Jane Smith",
+                "year": "2020",
+                "title": "Dup",
+                "publisher": "",
+                "filename": "Smith_Dup.pdf",
+                "file_hash": file_hash,
+                "quarantine_filename": "Smith_Dup.pdf",
+            },
+        )
+
+    def test_held_while_quarantined_copy_exists(self, sandbox):
+        utils.save_references_json([])
+        self._quarantine_event(sandbox, hashlib.sha256(self.CONTENT).hexdigest())
+        incoming = sandbox["todo"] / "again.pdf"
+        incoming.write_bytes(self.CONTENT)
+
+        processor = DocumentProcessor()
+        result = processor.run()
+
+        assert result["fatal_errors"] == 0
+        assert incoming.exists()
+        assert utils.load_references_json() == []
+        [conflict] = processor.conflicts[0]["conflicts"]
+        assert conflict["type"] == "previously_quarantined"
+        assert conflict["quarantine_filename"] == "Smith_Dup.pdf"
+        assert conflict["quarantined_at"] == "2026-01-02T03:04:05+00:00"
+        assert conflict["existing_file_present"] is True
+
+    def test_ingested_with_warning_when_quarantined_copy_gone(self, sandbox):
+        utils.save_references_json([])
+        self._quarantine_event(
+            sandbox, hashlib.sha256(self.CONTENT).hexdigest(), copy=False
+        )
+        incoming = sandbox["todo"] / "again.pdf"
+        incoming.write_bytes(self.CONTENT)
+
+        processor = DocumentProcessor()
+        processor.run()
+
+        assert not incoming.exists()
+        assert processor.conflicts == []
+        assert len(utils.load_references_json()) == 1
+        log = (sandbox["markdown"] / "log.md").read_text()
+        assert "quarantine/Smith_Dup.pdf" in log
+
+    def test_ingested_when_quarantined_copy_differs(self, sandbox):
+        utils.save_references_json([])
+        self._quarantine_event(sandbox, hashlib.sha256(self.CONTENT).hexdigest())
+        (sandbox["quarantine"] / "Smith_Dup.pdf").write_bytes(b"replaced")
+        (sandbox["todo"] / "again.pdf").write_bytes(self.CONTENT)
+
+        processor = DocumentProcessor()
+        processor.run()
+
+        assert processor.conflicts == []
+        assert len(utils.load_references_json()) == 1
+
+    def test_none_hash_quarantine_event_never_matches(self, sandbox):
+        """An unlisted file quarantined without a hash must not hold
+        anything -- in particular not a file whose hash failed to compute."""
+        utils.save_references_json([])
+        self._quarantine_event(sandbox, None)
+        (sandbox["todo"] / "again.pdf").write_bytes(self.CONTENT)
+
+        processor = DocumentProcessor()
+        processor.run()
+        assert processor.conflicts == []
+        assert len(utils.load_references_json()) == 1
+
+        # And directly: a None hash is never looked up
+        assert processor._check_conflicts({"file_hash": None}) == ([], None)
+
+    def test_quarantine_held_ignores_previously_quarantined(self, sandbox):
+        from src.scripts.utilities import quarantine_held
+
+        utils.save_references_json([])
+        self._quarantine_event(sandbox, hashlib.sha256(self.CONTENT).hexdigest())
+        incoming = sandbox["todo"] / "again.pdf"
+        incoming.write_bytes(self.CONTENT)
+        DocumentProcessor().run()
+
+        assert quarantine_held.load_held_duplicates() == []
+        assert quarantine_held.main(["--apply"]) == 0
+        assert incoming.exists()
+        assert sorted(p.name for p in sandbox["quarantine"].iterdir()) == [
+            "Smith_Dup.pdf"
+        ]
