@@ -29,6 +29,7 @@ from src.lib.utils import (
     create_reference_stub,
     check_hash_conflict,
     _atomic_write_text,
+    normalize_text,
 )
 
 # Configuration
@@ -110,8 +111,10 @@ class DocumentProcessor:
                 info = pdf_reader.metadata
 
                 if info:
-                    metadata["title"] = info.get("/Title", None)
-                    metadata["author"] = info.get("/Author", None)
+                    title = info.get("/Title", None)
+                    author = info.get("/Author", None)
+                    metadata["title"] = normalize_text(str(title)) if title else None
+                    metadata["author"] = normalize_text(str(author)) if author else None
 
                     # Try to extract year from creation or modification date
                     for date_key in ["/CreationDate", "/ModDate"]:
@@ -140,8 +143,8 @@ class DocumentProcessor:
         # Pattern 1: [Author]Title
         match = re.match(r"\[([^\]]+)\](.+)", name)
         if match:
-            info["author"] = match.group(1).strip()
-            info["title"] = match.group(2).strip()
+            info["author"] = normalize_text(match.group(1).strip())
+            info["title"] = normalize_text(match.group(2).strip())
             return info
 
         # Pattern 2: YYYY-Author-Title. The author segment must contain at
@@ -151,32 +154,33 @@ class DocumentProcessor:
         match = re.match(r"(\d{4})-([^-]+)-(.+)", name)
         if match and re.search(r"[^\W\d_]", match.group(2)):
             info["year"] = match.group(1)
-            info["author"] = match.group(2).strip()
-            info["title"] = match.group(3).strip()
+            info["author"] = normalize_text(match.group(2).strip())
+            info["title"] = normalize_text(match.group(3).strip())
             return info
 
         # Pattern 3: YYYY_Book_Title or similar
         match = re.match(r"(\d{4})_(?:Book|Article)_(.+)", name)
         if match:
             info["year"] = match.group(1)
-            info["title"] = match.group(2).strip()
+            info["title"] = normalize_text(match.group(2).strip())
             return info
 
         # Pattern 4: Author et al - Title
         match = re.match(r"^(.+?\bet al\.?)\s+-\s+(.+)$", name, re.IGNORECASE)
         if match:
-            info["author"] = match.group(1).strip()
-            info["title"] = match.group(2).strip()
+            info["author"] = normalize_text(match.group(1).strip())
+            info["title"] = normalize_text(match.group(2).strip())
             return info
 
         # Pattern 5: arxiv number + title
         match = re.match(r"(\d{4}\.\d+)\s*(.+)?", name)
         if match:
-            info["title"] = match.group(2).strip() if match.group(2) else match.group(1)
+            title = match.group(2).strip() if match.group(2) else match.group(1)
+            info["title"] = normalize_text(title)
             return info
 
         # Default: treat whole name as title
-        info["title"] = name
+        info["title"] = normalize_text(name)
         info["year"] = _extract_plausible_year(name)
 
         return info

@@ -8,6 +8,7 @@ import hashlib
 import importlib
 import io
 import json
+import unicodedata
 from pathlib import Path
 
 import pytest
@@ -375,6 +376,19 @@ class TestExtractFromFilename:
         assert info["author"] == expected_author
         assert info["title"] == expected_title
         assert info["year"] == expected_year
+
+    def test_nfd_filename_normalised_to_nfc(self):
+        """A macOS-decomposed (NFD) filename must yield NFC author/title,
+        so accented letters survive sanitize_title's character filtering
+        later in the pipeline instead of being silently dropped."""
+        nfd_filename = unicodedata.normalize(
+            "NFD", "[Gödel]Über formal unentscheidbare Sätze.pdf"
+        )
+        info = DocumentProcessor().extract_from_filename(nfd_filename)
+        assert info["author"] == "Gödel"
+        assert info["title"] == "Über formal unentscheidbare Sätze"
+        assert unicodedata.is_normalized("NFC", info["author"])
+        assert unicodedata.is_normalized("NFC", info["title"])
 
 
 class TestDocumentProcessor:

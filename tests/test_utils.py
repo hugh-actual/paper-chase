@@ -2,6 +2,7 @@
 """Unit tests for utils.py"""
 
 import json
+import unicodedata
 import pytest
 from pathlib import Path
 
@@ -20,6 +21,7 @@ from src.lib.utils import (  # noqa: E402
     rename_file,
     title_similarity,
     normalize_author_for_comparison,
+    normalize_text,
     calculate_file_hash,
     is_unknown_author,
     is_suspect_filename,
@@ -156,6 +158,15 @@ class TestParseAuthor:
         if len(names) > 1:
             assert names[1] in ["Hinton", "Hinton, et al"]
 
+    def test_nfd_input_normalised_to_nfc_surname(self):
+        """A macOS-decomposed (NFD) author name must still yield an
+        accented surname in precomposed (NFC) form, not a mangled one."""
+        nfd_author = unicodedata.normalize("NFD", "Gödel")
+        filename_part, names = parse_author(nfd_author)
+        assert filename_part == "Gödel"
+        assert unicodedata.is_normalized("NFC", filename_part)
+        assert names == ["Gödel"]
+
 
 # =============================================================================
 # Tests for sanitize_title()
@@ -236,6 +247,37 @@ class TestSanitizeTitle:
         assert "Statistical" in result
         assert "Learning" in result
         assert "Regression" in result
+
+    def test_nfd_input_keeps_accented_letters_in_nfc(self):
+        """A macOS-decomposed (NFD) title must not lose accented letters.
+        Without NFC normalisation, the combining mark left over from
+        decomposition isn't a `\\w` character, so the character filter
+        strips it and corrupts the accented letter (e.g. "Über" -> "ber")."""
+        nfd_title = unicodedata.normalize("NFD", "Über formal unentscheidbare Sätze")
+        result = sanitize_title(nfd_title)
+        assert result == "Über_formal_unentscheidbare_Sätze"
+        assert unicodedata.is_normalized("NFC", result)
+
+
+# =============================================================================
+# Tests for normalize_text()
+# =============================================================================
+
+
+class TestNormalizeText:
+    """Tests for normalize_text() function."""
+
+    def test_nfd_normalised_to_nfc(self):
+        nfd = unicodedata.normalize("NFD", "Über")
+        result = normalize_text(nfd)
+        assert result == "Über"
+        assert unicodedata.is_normalized("NFC", result)
+
+    def test_none_passthrough(self):
+        assert normalize_text(None) is None
+
+    def test_empty_string_passthrough(self):
+        assert normalize_text("") == ""
 
 
 # =============================================================================

@@ -11,6 +11,7 @@ import json
 import os
 import shutil
 import sys
+import unicodedata
 from datetime import datetime, timezone
 from difflib import SequenceMatcher
 from pathlib import Path
@@ -58,6 +59,27 @@ DOMAIN_ADJECTIVES = {
 }
 
 # =============================================================================
+# Unicode normalisation
+# =============================================================================
+
+
+def normalize_text(value):
+    """NFC-normalise Unicode text.
+
+    macOS decomposes accented characters into a base letter plus a
+    combining mark (NFD) in filenames it hands back (e.g. "Über" becomes
+    "U" + COMBINING DIAERESIS + "ber"). A combining mark alone isn't a
+    `\\w` character, so sanitize_title's character filtering silently drops
+    it, corrupting the accented letter. Normalising to NFC at every entry
+    point folds it back into a single precomposed character before that
+    filtering runs. Falsy/non-string values pass through unchanged.
+    """
+    if not value:
+        return value
+    return unicodedata.normalize("NFC", value)
+
+
+# =============================================================================
 # Author parsing
 # =============================================================================
 
@@ -74,7 +96,7 @@ def parse_author(author_str):
     if not author_str or author_str == "Unknown":
         return "Unknown", ["Unknown"]
 
-    author_str = author_str.strip()
+    author_str = normalize_text(author_str).strip()
 
     # Remove invalid filename characters (but keep for bibliography)
     author_str_clean = re.sub(r'[/\\<>:"|?*]', " ", author_str)
@@ -142,6 +164,8 @@ def sanitize_title(title):
     """
     if not title:
         return "Untitled"
+
+    title = normalize_text(title)
 
     # Remove special characters, keep alphanumeric and spaces
     title = re.sub(r"[^\w\s-]", " ", title)
