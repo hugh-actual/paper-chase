@@ -189,8 +189,10 @@ class DocumentProcessor:
         # Pattern 1: [Author]Title
         match = re.match(r"\[([^\]]+)\](.+)", name)
         if match:
+            title = match.group(2).strip()
             info["author"] = normalize_text(match.group(1).strip())
-            info["title"] = normalize_text(match.group(2).strip())
+            info["title"] = normalize_text(title)
+            info["year"] = _extract_plausible_year(title)
             info["structured"] = True
             return info
 
@@ -217,8 +219,10 @@ class DocumentProcessor:
         # Pattern 4: Author et al - Title
         match = re.match(r"^(.+?\bet al\.?)\s+-\s+(.+)$", name, re.IGNORECASE)
         if match:
+            title = match.group(2).strip()
             info["author"] = normalize_text(match.group(1).strip())
-            info["title"] = normalize_text(match.group(2).strip())
+            info["title"] = normalize_text(title)
+            info["year"] = _extract_plausible_year(title)
             info["structured"] = True
             return info
 

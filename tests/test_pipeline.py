@@ -328,7 +328,9 @@ class TestExtractFromFilename:
     matching: existing patterns (regression) plus the T8 fixes -- the
     YYYY-Author-Title pattern now requires a letter in the author segment,
     a new "Author et al - Title" pattern, and plausible-years-only
-    extraction in the default branch."""
+    extraction in the default branch -- plus the T7 follow-up: patterns 1
+    and 4 (which have no explicit year field) also take a plausible year
+    from the title itself, not just the default branch."""
 
     @pytest.mark.parametrize(
         "filename, expected_author, expected_title, expected_year",
@@ -340,6 +342,15 @@ class TestExtractFromFilename:
                 "Elements of Statistical Learning",
                 None,
             ),
+            # Pattern 1 takes a plausible year from the title when present
+            (
+                "[Hastie]Elements of Statistical Learning 2009.pdf",
+                "Hastie",
+                "Elements of Statistical Learning 2009",
+                "2009",
+            ),
+            # ... but not an implausible one (< 1500), like a book-count title
+            ("[Smith]Top 1000 Words.pdf", "Smith", "Top 1000 Words", None),
             # Pattern 2: YYYY-Author-Title (regression)
             ("2019-Smith-Great Findings.pdf", "Smith", "Great Findings", "2019"),
             # Pattern 2 must not match when the author segment has no letter
@@ -356,6 +367,13 @@ class TestExtractFromFilename:
                 None,
             ),
             ("Jones et al. - Another Paper.pdf", "Jones et al.", "Another Paper", None),
+            # Pattern 4 takes a plausible year from the title when present
+            (
+                "Smith et al - Survey 2015 Edition.pdf",
+                "Smith et al",
+                "Survey 2015 Edition",
+                "2015",
+            ),
             # Pattern 5: arxiv number + title (regression)
             (
                 "1706.03762 Attention Is All You Need.pdf",
@@ -937,9 +955,28 @@ class TestDocumentProcessor:
         assert entry["title"] == "Great Findings"
 
     def test_metadata_precedence_creation_date_never_used_for_year(self, sandbox):
-        """Plan T7 scenario (c): the bracket pattern is structured but
-        never carries a year; the PDF's CreationDate must not fill it in
-        either -- the entry's year stays empty ("n.d." downstream)."""
+        """Plan T7 scenario (c), updated per review follow-up: the bracket
+        pattern is structured and has no explicit year field, but does
+        take a plausible year from the title itself (2009) -- the PDF's
+        CreationDate (2021) must never be used, whether or not the title
+        supplies a year of its own."""
+        utils.save_references_json([])
+        content = make_pdf_bytes("irrelevant", "irrelevant", year="2021")
+        incoming = sandbox["todo"] / "[Hastie]Elements of Statistical Learning 2009.pdf"
+        incoming.write_bytes(content)
+
+        processor = DocumentProcessor()
+        processor.run()
+
+        entries = utils.load_references_json()
+        assert len(entries) == 1
+        assert entries[0]["year"] == "2009"
+
+    def test_metadata_precedence_bracket_pattern_without_year_gives_nd(self, sandbox):
+        """Companion to the case above: when the title carries no
+        plausible year either, the entry falls back to "n.d." (stored as
+        an empty year field) -- the CreationDate still must not fill it
+        in."""
         utils.save_references_json([])
         content = make_pdf_bytes("irrelevant", "irrelevant", year="2021")
         incoming = sandbox["todo"] / "[Hastie]Elements of Statistical Learning.pdf"
