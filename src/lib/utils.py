@@ -961,6 +961,63 @@ def is_junk_metadata(field: str, value: Optional[str]) -> bool:
     return False
 
 
+# Generic markers left by the software that produced a PDF, not by a
+# publisher. Short/common words are wrapped in \b so they don't match
+# inside an unrelated name (e.g. "cairo" the city). Collection-specific
+# publisher quirks don't belong here -- this list is deliberately generic.
+_PDF_SOFTWARE_MARKERS = (
+    r"pdftex",
+    r"\blatex\b",
+    r"\btex\b",
+    r"dvips",
+    r"dvipdf",
+    r"xdvipdf",
+    r"ghostscript",
+    r"acrobat",
+    r"adobe pdf library",
+    r"distiller",
+    r"microsoft",
+    r"quartz pdfcontext",
+    r"\bmacos\b",
+    r"mac os x",
+    r"skia/pdf",
+    r"pdfium",
+    r"itext",
+    r"pypdf",
+    r"reportlab",
+    r"\bcairo\b",
+    r"libreoffice",
+    r"openoffice",
+    r"\bprince\b",
+    r"wkhtmltopdf",
+    r"pscript",
+    r"\bnitro\b",
+    r"abbyy",
+    r"scansoft",
+    r"\bcanon\b",
+    r"\bxerox\b",
+)
+_PDF_SOFTWARE_RE = re.compile("|".join(_PDF_SOFTWARE_MARKERS), re.IGNORECASE)
+# A bare "PDF" followed by a version number, e.g. "PDF 1.4", the way
+# some producers stamp the spec version rather than naming themselves.
+_PDF_VERSION_RE = re.compile(r"\bpdf\s*[\d.]+", re.IGNORECASE)
+
+
+def looks_like_pdf_software(value: Optional[str]) -> bool:
+    """Check whether a `publisher` value looks like PDF-producing software
+    (embedded-PDF `/Producer` strings such as "pdfTeX-1.40.21", "Adobe
+    Acrobat Pro DC", "Microsoft: Print To PDF") rather than a real
+    publisher. Used by find_metadata_mismatches to flag entries whose
+    publisher should be cleared.
+
+    Deliberately generic only -- see is_junk_metadata.
+    """
+    if not value or not str(value).strip():
+        return False
+    v = str(value).strip()
+    return bool(_PDF_SOFTWARE_RE.search(v) or _PDF_VERSION_RE.search(v))
+
+
 def is_suspect_filename(filename: str) -> bool:
     """Check if a filename appears to have bad metadata."""
     # Remove .pdf extension

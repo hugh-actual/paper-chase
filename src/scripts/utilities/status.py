@@ -14,7 +14,11 @@ from datetime import datetime
 from pathlib import Path
 
 from src.lib import config
-from src.lib.utils import load_references_json, flatten_files_from_pairs
+from src.lib.utils import (
+    SUGGESTED_FIELDS,
+    load_references_json,
+    flatten_files_from_pairs,
+)
 
 
 def format_timestamp(filepath: Path) -> str:
@@ -37,14 +41,16 @@ def format_timestamp(filepath: Path) -> str:
 
 
 def count_annotated_entries(entries: list[dict]) -> int:
-    """Count entries with at least one non-null suggested_* field."""
+    """Count entries with at least one non-null suggested_* field.
+
+    Checks every field in SUGGESTED_FIELDS (not just author/title/year),
+    so a publisher-only annotation (suggested_publisher: "") still counts
+    as annotated instead of being silently ignored.
+    """
     annotated = 0
     for entry in entries:
-        if (
-            entry.get("suggested_author") is not None
-            or entry.get("suggested_title") is not None
-            or entry.get("suggested_year") is not None
-            or entry.get("quarantine") is True
+        if entry.get("quarantine") is True or any(
+            entry.get(field) is not None for field in SUGGESTED_FIELDS
         ):
             annotated += 1
     return annotated
@@ -135,6 +141,25 @@ def check_duplicate_candidates() -> dict:
         "timestamp": format_timestamp(filepath),
         "groups": len(exact_duplicates),
         "total_files": total_files,
+        "annotated": annotated,
+    }
+
+
+def check_metadata_mismatches() -> dict:
+    """Check status of metadata_mismatches.json."""
+    filepath = config.JSON_OUTPUT_DIR / "metadata_mismatches.json"
+    if not filepath.exists():
+        return {"exists": False}
+
+    with open(filepath, "r", encoding="utf-8") as f:
+        entries = json.load(f)
+
+    annotated = count_annotated_entries(entries)
+
+    return {
+        "exists": True,
+        "timestamp": format_timestamp(filepath),
+        "total": len(entries),
         "annotated": annotated,
     }
 
@@ -230,6 +255,14 @@ def main():
     else:
         print("\n   Duplicate Candidates: not generated")
 
+    mismatches = check_metadata_mismatches()
+    if mismatches["exists"]:
+        print(f"\n   Metadata Mismatches ({mismatches['timestamp']}):")
+        print(f"   - {mismatches['total']} entries found")
+        print(f"   - {mismatches['annotated']} entries annotated")
+    else:
+        print("\n   Metadata Mismatches: not generated")
+
     # Recommendations
     print("\n💡 Recommendations:")
 
@@ -291,9 +324,25 @@ def main():
         elif duplicates["annotated"] > 0:
             recommendations.append("Run 'make update-dups' to apply annotations")
 
+    if mismatches["exists"] and mismatches["total"] > 0:
+        unannotated = mismatches["total"] - mismatches["annotated"]
+        if unannotated > 0:
+            recommendations.append(
+                f"Annotate {unannotated} entries in metadata_mismatches.json, "
+                f"then run 'make update-mismatches'"
+            )
+        elif mismatches["annotated"] > 0:
+            recommendations.append("Run 'make update-mismatches' to apply annotations")
+
     # Check if no detection has been run
     if not any(
-        [similar["exists"], unknown["exists"], broken["exists"], duplicates["exists"]]
+        [
+            similar["exists"],
+            unknown["exists"],
+            broken["exists"],
+            duplicates["exists"],
+            mismatches["exists"],
+        ]
     ):
         recommendations.append(
             "Run 'make detect-all' to find issues in your collection"

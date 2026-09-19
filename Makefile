@@ -1,7 +1,7 @@
 .PHONY: help status ingest detect-all update-all \
         process generate \
-        find-broken find-unknown detect-dups \
-        update-broken update-unknown update-dups update-similar \
+        find-broken find-unknown detect-dups find-mismatches \
+        update-broken update-unknown update-dups update-similar update-mismatches \
         verify validate recover quarantine-held \
         test format lint extract
 
@@ -23,12 +23,14 @@ help:
 	@echo "  make find-broken    Find broken titles"
 	@echo "  make find-unknown   Find unknown authors"
 	@echo "  make detect-dups    Duplicate detection (exact, similar, suffix)"
+	@echo "  make find-mismatches  Find publisher/filename metadata mismatches"
 	@echo ""
 	@echo "Updates (apply annotated JSON changes):"
 	@echo "  make update-broken  Apply broken title fixes"
 	@echo "  make update-unknown Apply unknown author fixes"
 	@echo "  make update-dups    Apply exact duplicate fixes"
 	@echo "  make update-similar Apply similar pair fixes"
+	@echo "  make update-mismatches  Apply metadata mismatch fixes"
 	@echo ""
 	@echo "Verification:"
 	@echo "  make verify         Check files vs metadata consistency"
@@ -52,11 +54,11 @@ ingest: process verify
 	@echo ""
 	@echo "✓ Ingestion complete"
 
-detect-all: find-broken find-unknown detect-dups
+detect-all: find-broken find-unknown detect-dups find-mismatches
 	@echo ""
 	@echo "✓ All detection complete. Review JSON files in json-output/"
 
-update-all: update-broken update-unknown update-dups update-similar verify
+update-all: update-broken update-unknown update-dups update-similar update-mismatches verify
 	@echo ""
 	@echo "✓ All updates applied and verified"
 
@@ -77,6 +79,9 @@ find-unknown:
 detect-dups:
 	uv run python -m src.scripts.detection.detect_duplicates
 
+find-mismatches:
+	uv run python -m src.scripts.detection.find_metadata_mismatches
+
 # Updates
 update-broken:
 	uv run python -m src.scripts.updates.update_broken_titles
@@ -89,6 +94,9 @@ update-dups:
 
 update-similar:
 	uv run python -m src.scripts.updates.update_similar_pairs
+
+update-mismatches:
+	uv run python -m src.scripts.updates.update_metadata_mismatches
 
 # Verification
 verify:

@@ -685,6 +685,7 @@ UPDATE_MODULES = [
     "src.scripts.updates.update_unknown_authors",
     "src.scripts.updates.update_exact_duplicates",
     "src.scripts.updates.update_similar_pairs",
+    "src.scripts.updates.update_metadata_mismatches",
 ]
 
 
@@ -2049,3 +2050,226 @@ def test_recover_ignores_none_fields_in_later_events(sandbox):
     [entry] = recover_orphans.plan_recovery([], utils.load_history())["restored"]
     assert entry["original_filename"] == "dl.pdf"
     assert entry["title"] == "Paper"
+
+
+class TestFindMetadataMismatches:
+    """find_metadata_mismatches.py: publisher-software detection and
+    filename-derived corrections (T13). Read-only w.r.t. references.json."""
+
+    def _entry(self, **overrides):
+        base = {
+            "author": "Jane Smith",
+            "year": "2020",
+            "title": "A Paper",
+            "publisher": "Springer",
+            "filename": "Smith_A_Paper.pdf",
+        }
+        base.update(overrides)
+        return base
+
+    def test_pdf_software_publisher_is_flagged(self, sandbox):
+        from src.scripts.detection import find_metadata_mismatches
+
+        utils.save_references_json([self._entry(publisher="pdfTeX-1.40.21")])
+
+        [result] = find_metadata_mismatches.find_metadata_mismatches()
+        assert result["suggested_publisher"] == ""
+        assert "publisher looks like PDF-generating software" in result["reasons"]
+
+    def test_real_publisher_is_not_flagged(self, sandbox):
+        from src.scripts.detection import find_metadata_mismatches
+
+        utils.save_references_json([self._entry(publisher="Springer")])
+
+        assert find_metadata_mismatches.find_metadata_mismatches() == []
+
+    def test_structured_filename_mismatch_suggests_author_title_year(self, sandbox):
+        from src.scripts.detection import find_metadata_mismatches
+
+        utils.save_references_json(
+            [
+                self._entry(
+                    author="Administrator",
+                    title="Microsoft Word - draft3.doc",
+                    year="2019",
+                    publisher="Springer",
+                    filename="Administrator_draft3.pdf",
+                    original_filename="1975-Knuth-Art of Computer Programming.pdf",
+                )
+            ]
+        )
+
+        [result] = find_metadata_mismatches.find_metadata_mismatches()
+        assert result["suggested_author"] == "Knuth"
+        assert result["suggested_title"] == "Art of Computer Programming"
+        assert result["suggested_year"] == "1975"
+        assert result["suggested_publisher"] is None
+        assert set(result["reasons"]) == {
+            "original filename suggests a different author",
+            "original filename suggests a different title",
+            "original filename suggests a different year",
+        }
+
+    def test_no_original_filename_is_not_reported(self, sandbox):
+        """Nothing wrong except there's no original_filename to compare
+        against -- the entry isn't reported at all."""
+        from src.scripts.detection import find_metadata_mismatches
+
+        utils.save_references_json([self._entry()])
+
+        assert find_metadata_mismatches.find_metadata_mismatches() == []
+
+    def test_unstructured_original_filename_is_not_suggested(self, sandbox):
+        from src.scripts.detection import find_metadata_mismatches
+
+        utils.save_references_json(
+            [
+                self._entry(
+                    publisher="pdfTeX-1.40.21",
+                    original_filename="random_scan_0042.pdf",
+                )
+            ]
+        )
+
+        [result] = find_metadata_mismatches.find_metadata_mismatches()
+        assert result["suggested_publisher"] == ""
+        assert result["suggested_author"] is None
+        assert result["suggested_title"] is None
+        assert result["suggested_year"] is None
+
+    def test_filename_surname_form_matches_full_stored_name(self, sandbox):
+        """ "Jane Smith" (stored) vs "Smith" (filename surname) is not a
+        mismatch -- compared on parse_author's surname form."""
+        from src.scripts.detection import find_metadata_mismatches
+
+        utils.save_references_json(
+            [
+                self._entry(
+                    author="Jane Smith",
+                    title="A Paper",
+                    year="2020",
+                    original_filename="[Smith]A Paper.pdf",
+                )
+            ]
+        )
+
+        assert find_metadata_mismatches.find_metadata_mismatches() == []
+
+    def test_does_not_modify_references_json(self, sandbox):
+        from src.scripts.detection import find_metadata_mismatches
+
+        utils.save_references_json(
+            [
+                self._entry(
+                    publisher="pdfTeX-1.40.21",
+                    original_filename="1975-Knuth-Art of Computer Programming.pdf",
+                )
+            ]
+        )
+        before = sandbox["references_json"].read_bytes()
+
+        find_metadata_mismatches.find_metadata_mismatches()
+
+        assert sandbox["references_json"].read_bytes() == before
+
+
+class TestMetadataMismatchesEndToEnd:
+    """detect -> annotate (as find_metadata_mismatches would produce) ->
+    update: a publisher-only fix doesn't rename, a filename-derived fix
+    does and is journalled, and references.md is regenerated."""
+
+    def test_detect_annotate_update_flow(self, sandbox):
+        from src.scripts.detection import find_metadata_mismatches
+        from src.scripts.updates import update_metadata_mismatches
+
+        # Entry A: publisher-only issue -- clearing it must not rename it.
+        path_a = sandbox["reference"] / "Doe_A_Paper.pdf"
+        path_a.write_bytes(DUMMY_PDF)
+        entry_a = {
+            "author": "Jane Doe",
+            "year": "2020",
+            "title": "A Paper",
+            "publisher": "pdfTeX-1.40.21",
+            "filename": "Doe_A_Paper.pdf",
+            "file_hash": utils.calculate_file_hash(path_a),
+        }
+
+        # Entry B: filename-derived mismatch -- correcting it must rename.
+        path_b = sandbox["reference"] / "Administrator_draft3.pdf"
+        path_b.write_bytes(b"different content so the hash differs")
+        entry_b = {
+            "author": "Administrator",
+            "year": "2019",
+            "title": "Microsoft Word - draft3.doc",
+            "publisher": "Springer",
+            "filename": "Administrator_draft3.pdf",
+            "original_filename": "1975-Knuth-Art of Computer Programming.pdf",
+            "file_hash": utils.calculate_file_hash(path_b),
+        }
+        utils.save_references_json([entry_a, entry_b])
+
+        results = find_metadata_mismatches.find_metadata_mismatches()
+        assert len(results) == 2
+        on_disk = json.loads(
+            (sandbox["json_output"] / "metadata_mismatches.json").read_text()
+        )
+        assert on_disk == results
+
+        assert update_metadata_mismatches.main() == 0
+
+        by_hash = {e["file_hash"]: e for e in utils.load_references_json()}
+
+        a = by_hash[entry_a["file_hash"]]
+        assert a["publisher"] == ""
+        assert a["filename"] == "Doe_A_Paper.pdf"  # unchanged: no rename
+
+        b = by_hash[entry_b["file_hash"]]
+        assert b["author"] == "Knuth"
+        assert b["title"] == "Art of Computer Programming"
+        assert b["year"] == "1975"
+        assert b["filename"] != "Administrator_draft3.pdf"
+        assert (sandbox["reference"] / b["filename"]).exists()
+        assert not path_b.exists()
+
+        rename_events = [e for e in utils.load_history() if e["event"] == "rename"]
+        assert any(e["filename"] == b["filename"] for e in rename_events)
+
+        md = sandbox["references_md"].read_text()
+        assert a["filename"] in md
+        assert b["filename"] in md
+
+
+class TestStatusMetadataMismatches:
+    """status.py's count_annotated_entries must recognise a publisher-only
+    annotation, not just author/title/year (the bug T13 fixes)."""
+
+    def test_counts_publisher_only_annotation(self, sandbox):
+        from src.scripts.utilities import status
+
+        mismatches_file = sandbox["json_output"] / "metadata_mismatches.json"
+        mismatches_file.write_text(
+            json.dumps(
+                [
+                    {
+                        "filename": "A.pdf",
+                        "quarantine": None,
+                        "suggested_author": None,
+                        "suggested_title": None,
+                        "suggested_year": None,
+                        "suggested_publisher": "",
+                    }
+                ]
+            )
+        )
+
+        assert status.check_metadata_mismatches() == {
+            "exists": True,
+            "timestamp": "today",
+            "total": 1,
+            "annotated": 1,
+        }
+
+    def test_not_generated_when_missing(self, sandbox):
+        from src.scripts.utilities import status
+
+        assert status.check_metadata_mismatches() == {"exists": False}

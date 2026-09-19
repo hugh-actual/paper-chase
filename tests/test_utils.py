@@ -25,6 +25,7 @@ from src.lib.utils import (  # noqa: E402
     calculate_file_hash,
     is_unknown_author,
     is_junk_metadata,
+    looks_like_pdf_software,
     is_suspect_filename,
     check_hash_conflict,
     check_filename_conflict,
@@ -819,6 +820,75 @@ class TestIsJunkMetadata:
 
     def test_real_author_is_not_junk(self):
         assert is_junk_metadata("author", "Jane Doe") is False
+
+
+# =============================================================================
+# Tests for looks_like_pdf_software()
+# =============================================================================
+
+
+class TestLooksLikePdfSoftware:
+    """Tests for looks_like_pdf_software() function."""
+
+    @pytest.mark.parametrize(
+        "value",
+        [
+            "pdfTeX-1.40.21",
+            "LaTeX with hyperref package",
+            "TeX output 2021.01.01:1234",
+            "dvips(k) 5.998",
+            "dvipdf(k)",
+            "xdvipdfmx (20200315)",
+            "GPL Ghostscript 9.55.0",
+            "Adobe Acrobat Pro DC",
+            "Adobe PDF Library 4.16",
+            "Acrobat Distiller 4.16",
+            "Microsoft: Print To PDF",
+            "Microsoft Word",
+            "Quartz PDFContext",
+            "macOS Version 13.4.1 (Build 22F82)",
+            "Mac OS X 10.6.8 Quartz PDFContext",
+            "Skia/PDF m108",
+            "PDFium",
+            "iText 5.5.13.1",
+            "pypdf",
+            "PyPDF2",
+            "ReportLab PDF Library - www.reportlab.com",
+            "cairo 1.16.0 (https://cairographics.org)",
+            "LibreOffice 7.3",
+            "OpenOffice.org 3.4",
+            "Prince 14.2",
+            "wkhtmltopdf 0.12.6",
+            "PScript5.dll Version 5.2.2",
+            "Nitro PDF Creator",
+            "ABBYY FineReader 12",
+            "ScanSoft PDF Create!",
+            "Canon MF Scan Utility",
+            "Xerox WorkCentre 7845",
+            "PDF 1.4",
+        ],
+    )
+    def test_flags_pdf_producing_software(self, value):
+        assert looks_like_pdf_software(value) is True
+
+    @pytest.mark.parametrize(
+        "value",
+        [
+            "Springer",
+            "MIT Press",
+            "O'Reilly",
+            "Cambridge University Press",
+            "Elsevier",
+            "Wiley",
+        ],
+    )
+    def test_does_not_flag_plausible_publishers(self, value):
+        assert looks_like_pdf_software(value) is False
+
+    def test_blank_or_missing_is_not_flagged(self):
+        assert looks_like_pdf_software("") is False
+        assert looks_like_pdf_software(None) is False
+        assert looks_like_pdf_software("   ") is False
 
 
 # =============================================================================
