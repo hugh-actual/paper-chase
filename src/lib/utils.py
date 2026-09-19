@@ -356,6 +356,59 @@ def latest_history_event(history, events, **match):
     return None
 
 
+# History events whose `filename` is where a file ended up in reference/
+PLACING_EVENTS = ("ingest", "rename", "relink")
+
+# Guard against a (malformed) rename cycle when following a chain
+MAX_RENAME_HOPS = 50
+
+
+def explain_orphan(history, filename, file_hash):
+    """The latest event that placed `filename` with this hash, or None."""
+    if not file_hash:
+        return None
+    return latest_history_event(
+        history, PLACING_EVENTS, filename=filename, file_hash=file_hash
+    )
+
+
+def explain_missing_file(history, entry):
+    """Explain where a missing entry's file went.
+
+    Returns ("renamed", event) for the rename chain's last hop whose target
+    exists on disk with the recorded hash, ("quarantined", event) when a
+    quarantine event moved it out and the quarantined file exists, or
+    (None, None) when history doesn't explain it.
+    """
+    filename = entry["filename"]
+    file_hash = entry.get("file_hash")
+    renamed = None
+
+    for _ in range(MAX_RENAME_HOPS):
+        match = {"filename": filename}
+        if file_hash:
+            match["file_hash"] = file_hash
+        quarantine = latest_history_event(history, ("quarantine",), **match)
+        if quarantine and quarantine.get("quarantine_filename"):
+            if (config.QUARANTINE_DIR / quarantine["quarantine_filename"]).exists():
+                return "quarantined", quarantine
+
+        match = {"old_filename": filename}
+        if file_hash:
+            match["file_hash"] = file_hash
+        rename = latest_history_event(history, ("rename",), **match)
+        if not rename or not rename.get("file_hash"):
+            break
+        file_hash = rename["file_hash"]
+        filename = rename["filename"]
+        target = config.REFERENCE_DIR / filename
+        if target.exists() and calculate_file_hash(target) == file_hash:
+            renamed = rename
+            # Keep following: the file may have been renamed again
+
+    return ("renamed", renamed) if renamed else (None, None)
+
+
 def build_reference_entry(
     author_names,
     year,

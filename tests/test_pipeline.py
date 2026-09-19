@@ -1776,3 +1776,97 @@ class TestPreviouslyQuarantined:
         assert sorted(p.name for p in sandbox["quarantine"].iterdir()) == [
             "Smith_Dup.pdf"
         ]
+
+
+class TestVerifyHistoryHints:
+    def test_no_recover_hint_without_history(self, sandbox, capsys):
+        from src.scripts.core import verify_files_and_metadata
+
+        (sandbox["reference"] / "Stray_File.pdf").write_bytes(b"stray")
+        utils.save_references_json(
+            [
+                {
+                    "author": "A",
+                    "year": "",
+                    "title": "Gone",
+                    "publisher": "",
+                    "filename": "A_Gone.pdf",
+                    "file_hash": "abc",
+                }
+            ]
+        )
+
+        assert verify_files_and_metadata.main() == 1
+        assert "make recover" not in capsys.readouterr().out
+
+    def test_missing_file_explained_by_rename(self, sandbox, capsys):
+        from src.scripts.core import verify_files_and_metadata
+
+        new = sandbox["reference"] / "Smith_New.pdf"
+        new.write_bytes(b"content")
+        file_hash = utils.calculate_file_hash(new)
+        utils.save_references_json(
+            [
+                {
+                    "author": "Jane Smith",
+                    "year": "",
+                    "title": "Old",
+                    "publisher": "",
+                    "filename": "Smith_Old.pdf",
+                    "file_hash": file_hash,
+                }
+            ]
+        )
+        write_history(
+            sandbox,
+            {
+                "event": "rename",
+                "old_filename": "Smith_Old.pdf",
+                "filename": "Smith_New.pdf",
+                "file_hash": file_hash,
+                "original_filename": None,
+                "title": "New",
+            },
+        )
+
+        assert verify_files_and_metadata.main() == 1
+        out = capsys.readouterr().out
+        assert "Smith_Old.pdf  (renamed to: Smith_New.pdf)" in out
+        assert "make recover" in out
+
+
+def test_recover_ignores_none_fields_in_later_events(sandbox):
+    """steps.py records original_filename=None on a rename of an entry that
+    had none; that must not wipe the value an earlier ingest recorded."""
+    from src.scripts.utilities import recover_orphans
+
+    path = sandbox["reference"] / "Smith_Paper.pdf"
+    path.write_bytes(b"content")
+    file_hash = utils.calculate_file_hash(path)
+    write_history(
+        sandbox,
+        {
+            "event": "ingest",
+            "filename": "Smith_Old.pdf",
+            "file_hash": file_hash,
+            "author": "Jane Smith",
+            "title": "Old",
+            "year": "2020",
+            "publisher": "",
+            "original_filename": "dl.pdf",
+        },
+        {
+            "event": "rename",
+            "old_filename": "Smith_Old.pdf",
+            "filename": "Smith_Paper.pdf",
+            "file_hash": file_hash,
+            "original_filename": None,
+            "author": "Jane Smith",
+            "title": "Paper",
+            "year": "2020",
+        },
+    )
+
+    [entry] = recover_orphans.plan_recovery([], utils.load_history())["restored"]
+    assert entry["original_filename"] == "dl.pdf"
+    assert entry["title"] == "Paper"
