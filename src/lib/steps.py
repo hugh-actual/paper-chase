@@ -423,9 +423,14 @@ class UpdateStep(ABC):
                 self._record_error("update", filename, "File not found")
                 continue
 
-            # Generate new filename
+            # Generate new filename. The file's own name counts as free, so
+            # an update that doesn't change the name keeps it (no `_2`).
             new_filename, author_names = generate_new_filename(
-                final_author, final_title, self.processed_files, config.REFERENCE_DIR
+                final_author,
+                final_title,
+                self.processed_files,
+                config.REFERENCE_DIR,
+                current_filename=filename,
             )
 
             # The entry's new values, exactly as they will be stored

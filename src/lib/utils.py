@@ -548,29 +548,45 @@ def get_entry_from_references_json(filename):
 # =============================================================================
 
 
-def check_duplicate_filename(new_filename, processed_files, target_dir=None):
-    """Check if filename already exists, add suffix if needed."""
+def check_duplicate_filename(
+    new_filename, processed_files, target_dir=None, current_filename=None
+):
+    """Check if filename already exists, add suffix if needed.
+
+    `current_filename` is the name the file being renamed already has: it
+    is on disk (or reserved earlier this run) only because it *is* this
+    file, so it counts as free. Without that, renaming a file to its own
+    name would suffix it (`X.pdf` -> `X_2.pdf`). Every other name on disk
+    or in `processed_files` is still taken.
+    """
     if target_dir is None:
         target_dir = config.REFERENCE_DIR
 
-    if new_filename not in processed_files and not (target_dir / new_filename).exists():
+    def taken(name):
+        if name == current_filename:
+            return False
+        return name in processed_files or (target_dir / name).exists()
+
+    if not taken(new_filename):
         return new_filename
 
     base, ext = new_filename.rsplit(".", 1)
     counter = 2
-    while (
-        f"{base}_{counter}.{ext}" in processed_files
-        or (target_dir / f"{base}_{counter}.{ext}").exists()
-    ):
+    while taken(f"{base}_{counter}.{ext}"):
         counter += 1
 
     return f"{base}_{counter}.{ext}"
 
 
-def generate_new_filename(author, title, processed_files=None, target_dir=None):
+def generate_new_filename(
+    author, title, processed_files=None, target_dir=None, current_filename=None
+):
     """
     Generate a new filename from author and title.
     Returns (new_filename, author_names_list).
+
+    Pass `current_filename` when renaming an existing file, so its own
+    name isn't treated as taken (see check_duplicate_filename).
     """
     if processed_files is None:
         processed_files = set()
@@ -587,7 +603,9 @@ def generate_new_filename(author, title, processed_files=None, target_dir=None):
         title_filename = "_".join(title_filename.split("_")[:10])
         new_filename = f"{author_filename}_{title_filename}.pdf"
 
-    new_filename = check_duplicate_filename(new_filename, processed_files, target_dir)
+    new_filename = check_duplicate_filename(
+        new_filename, processed_files, target_dir, current_filename
+    )
 
     return new_filename, author_names
 

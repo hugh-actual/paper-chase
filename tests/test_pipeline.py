@@ -501,6 +501,82 @@ class TestUpdateStepJournal:
         assert [h["filename"] for h in failed] == ["Doe_Real.pdf"]
 
 
+class TestUpdateStepFilenames:
+    """A file's own current name is never treated as taken by another file,
+    so updates that don't change the name don't suffix or shuffle it."""
+
+    def test_year_only_update_keeps_the_name(self, sandbox):
+        entry = seed_entry(
+            sandbox, "Doe_Old_Title.pdf", "Jane Doe", "Old Title", content=b"a"
+        )
+        utils.save_references_json([entry])
+        write_annotations(
+            sandbox, [{"filename": entry["filename"], "suggested_year": "1999"}]
+        )
+
+        result = SimpleStep().run()
+
+        assert result["updated"] == 1
+        assert result["fatal_errors"] == 0
+        [stored] = utils.load_references_json()
+        assert stored["filename"] == "Doe_Old_Title.pdf"
+        assert stored["year"] == "1999"
+        assert [p.name for p in sandbox["reference"].iterdir()] == ["Doe_Old_Title.pdf"]
+
+        # Metadata-only updates are journalled with old_filename == filename
+        [event] = utils.load_history()
+        assert event["event"] == "rename"
+        assert event["old_filename"] == event["filename"] == "Doe_Old_Title.pdf"
+        assert event["year"] == "1999"
+        assert event["previous"]["year"] == "2020"
+
+    def test_title_update_onto_another_files_name_still_suffixes(self, sandbox):
+        other = seed_entry(
+            sandbox, "Doe_Other_Work.pdf", "Jane Doe", "Other Work", content=b"o"
+        )
+        entry = seed_entry(
+            sandbox, "Doe_Old_Title.pdf", "Jane Doe", "Old Title", content=b"a"
+        )
+        utils.save_references_json([other, entry])
+        write_annotations(
+            sandbox,
+            [{"filename": entry["filename"], "suggested_title": "Other Work"}],
+        )
+
+        SimpleStep().run()
+
+        by_hash = {e["file_hash"]: e for e in utils.load_references_json()}
+        assert by_hash[other["file_hash"]]["filename"] == "Doe_Other_Work.pdf"
+        assert by_hash[entry["file_hash"]]["filename"] == "Doe_Other_Work_2.pdf"
+        assert (sandbox["reference"] / "Doe_Other_Work.pdf").read_bytes() == b"o"
+        assert (sandbox["reference"] / "Doe_Other_Work_2.pdf").read_bytes() == b"a"
+
+    def test_suffixed_file_is_not_shuffled(self, sandbox):
+        """`X_2.pdf` regenerating base `X.pdf` while another `X.pdf` exists
+        stays `X_2.pdf` -- not `X_3.pdf`."""
+        base = seed_entry(
+            sandbox, "Doe_Old_Title.pdf", "Jane Doe", "Old Title", content=b"a"
+        )
+        second = seed_entry(
+            sandbox, "Doe_Old_Title_2.pdf", "Jane Doe", "Old Title", content=b"b"
+        )
+        utils.save_references_json([base, second])
+        write_annotations(
+            sandbox, [{"filename": second["filename"], "suggested_year": "1999"}]
+        )
+
+        SimpleStep().run()
+
+        by_hash = {e["file_hash"]: e for e in utils.load_references_json()}
+        assert by_hash[base["file_hash"]]["filename"] == "Doe_Old_Title.pdf"
+        assert by_hash[second["file_hash"]]["filename"] == "Doe_Old_Title_2.pdf"
+        assert by_hash[second["file_hash"]]["year"] == "1999"
+        assert sorted(p.name for p in sandbox["reference"].iterdir()) == [
+            "Doe_Old_Title.pdf",
+            "Doe_Old_Title_2.pdf",
+        ]
+
+
 UPDATE_MODULES = [
     "src.scripts.updates.update_broken_titles",
     "src.scripts.updates.update_unknown_authors",

@@ -368,6 +368,35 @@ class TestCheckDuplicateFilename:
         result = check_duplicate_filename("Smith_Test.pdf", set(), target_dir=tmp_path)
         assert result == "Smith_Test_2.pdf"
 
+    def test_own_current_name_is_free(self, tmp_path):
+        """Renaming a file to its own name keeps it, not `_2`."""
+        (tmp_path / "Smith_Test.pdf").touch()
+        result = check_duplicate_filename(
+            "Smith_Test.pdf", set(), tmp_path, current_filename="Smith_Test.pdf"
+        )
+        assert result == "Smith_Test.pdf"
+
+    def test_suffixed_current_name_is_kept_not_shuffled(self, tmp_path):
+        """`X_2.pdf` whose base `X.pdf` belongs to another file stays `X_2`."""
+        (tmp_path / "Smith_Test.pdf").touch()
+        (tmp_path / "Smith_Test_2.pdf").touch()
+        result = check_duplicate_filename(
+            "Smith_Test.pdf", set(), tmp_path, current_filename="Smith_Test_2.pdf"
+        )
+        assert result == "Smith_Test_2.pdf"
+
+    def test_other_files_still_taken_with_current_name(self, tmp_path):
+        """A different file's name on disk, or a name reserved this run,
+        is never handed out just because current_filename is set."""
+        (tmp_path / "Smith_Test.pdf").touch()
+        result = check_duplicate_filename(
+            "Smith_Test.pdf",
+            {"Smith_Test_2.pdf"},
+            tmp_path,
+            current_filename="Jones_Other.pdf",
+        )
+        assert result == "Smith_Test_3.pdf"
+
 
 # =============================================================================
 # Tests for generate_new_filename()
