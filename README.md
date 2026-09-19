@@ -60,7 +60,7 @@ Four simple commands handle most workflows:
 ```bash
 make status         # Check collection status and get recommendations
 make ingest         # Process new PDFs and verify
-make detect-all     # Find issues (duplicates, unknown authors, broken titles)
+make detect-all     # Find issues (duplicates, unknown authors, broken titles, metadata mismatches)
 make update-all     # Apply all fixes and verify
 ```
 
@@ -76,13 +76,26 @@ make update-all     # Apply all fixes and verify
    ```bash
    make ingest
    ```
-   This processes new files and verifies your collection in one step.
+   This processes new files, then verifies your collection. A genuine failure (a file that
+   couldn't be moved, or `references.json`/`references.md` failing to write) exits nonzero
+   and `make ingest` stops *before* running `verify`; a clean run — including one with only
+   routine conflicts or skipped files — exits 0 and proceeds to `verify` as usual.
 
 3. **Check status**:
    ```bash
    make status
    ```
-   Shows you what happened and what to do next.
+   Shows you what happened, including any files still held in `todo/`, and what to do next.
+
+4. **Resolve held duplicates**, if any:
+   ```bash
+   make quarantine-held         # dry run: lists what would move
+   make quarantine-held APPLY=1 # moves them
+   ```
+   Files ingest held back as exact duplicates of an existing entry go here — never delete
+   them from `todo/` by hand. Each one is re-checked at move time (the existing copy must
+   still be present in `reference/` and hash identically) before being quarantined; a
+   same-named file already in `quarantine/` is never overwritten.
 
 ### 2. Cleaning Up Your Collection
 
@@ -90,7 +103,8 @@ make update-all     # Apply all fixes and verify
    ```bash
    make detect-all
    ```
-   This finds duplicates, unknown authors, and broken titles in one go.
+   This finds duplicates, unknown authors, broken titles, and metadata mismatches
+   (`find-broken`, `find-unknown`, `detect-dups`, `find-mismatches`) in one go.
 
 2. **Check what was found**:
    ```bash
@@ -100,19 +114,26 @@ make update-all     # Apply all fixes and verify
 
 3. **Review and annotate** the JSON files in `json-output/`:
    - Mark duplicates with `"quarantine": true`
-   - Fill in `suggested_author`, `suggested_title`, `suggested_year` for fixes
+   - Fill in `suggested_author`, `suggested_title`, `suggested_year`, `suggested_publisher`
+     for fixes
+   - Every `suggested_*` field is independent: `null` keeps the current value, any string
+     sets it. `suggested_publisher` is the one field where `""` is meaningful (it clears a
+     bogus publisher) — everywhere else use `null`, not `""`, for "no change".
 
 4. **Apply all fixes**:
    ```bash
    make update-all
    ```
-   Applies all your annotations and verifies the collection.
+   Applies all your annotations (`update-broken`, `update-unknown`, `update-dups`,
+   `update-similar`, `update-mismatches`) and verifies the collection. A publisher-only
+   update changes only the publisher — it doesn't rename the file.
 
    Each `update-*` step exits nonzero on a genuine failure — a file that could not
    be renamed or moved — which halts the chain instead of running to the end and
    reporting success. Entries it simply had nothing to do for (already applied on an
-   earlier run, or annotated in two files at once) are reported as **Skipped**, not
-   failures, so reruns are harmless. The last line of each step says which you got.
+   earlier run, its detection JSON not generated yet, or annotated in two files at once)
+   are reported as **Skipped**, not failures, so reruns are harmless. The last line of
+   each step says which you got.
 
 ### 3. Check Collection Health
 
@@ -154,12 +175,26 @@ Run `make help` to see all available commands.
 
 ```
 <DOCS_BASE_DIR>/          # whatever you set in .env
-├── reference/        # Your organized PDF library
-├── quarantine/       # Duplicates and removed files
-├── todo/             # New PDFs to process
-├── references.json   # Metadata database (source of truth)
-└── references.md     # Human-readable bibliography (generated from `.json`)
+├── reference/         # Your organized PDF library
+├── quarantine/        # Duplicates and removed files (moves here never overwrite)
+├── todo/              # New PDFs to process
+├── history.jsonl       # Append-only journal of every move/rename/quarantine
+├── references.json    # Metadata database (source of truth)
+├── references.json.bak # Pre-run backup, copied before the first save of each run
+└── references.md      # Human-readable bibliography (generated from `.json`)
 ```
+
+## Metadata Extraction
+
+When a filename matches a recognized pattern (`[Author]Title`, `YYYY-Author-Title`,
+`YYYY_Book_Title`, `Author et al - Title`), that pattern wins field-by-field over embedded
+PDF metadata, which is often generic junk (`/Title` "Microsoft Word - draft3.doc", `/Author`
+"Administrator") — metadata only fills a field the filename left blank. An unstructured
+filename instead lets non-junk PDF metadata win, falling back to the filename otherwise.
+Publication year always comes from the filename (or "n.d." if none is found), never from
+`/CreationDate`/`/ModDate` (those record when a file was scanned or saved, not published).
+Publisher is likewise never taken from `/Producer` (the PDF-generating software); it starts
+blank and is set later via `suggested_publisher`.
 
 ## Naming Convention
 
@@ -173,10 +208,19 @@ Titles are sanitized by removing common words (a, an, the, of, etc.) while keepi
 
 ## Data Files
 
-All metadata is stored in `references.json` (the source of truth). Other files are generated from it:
+All metadata is stored in `references.json` (the source of truth), written atomically and
+saved after every file during `make ingest` (not once at the end) so an interrupted run
+can't lose a file's original name. `references.json.bak` holds the state from before the
+run started. Other files are generated or journalled alongside it:
 
 - `references.md` - Human-readable bibliography
-- `json-output/*.json` - Working files for detection and fixes
+- `history.jsonl` - Append-only journal: one JSON line per `ingest`/`relink`/`rename`/
+  `quarantine`/`quarantine_held` event (plus a matching `_failed` event if a move is
+  interrupted), written *before* the move it describes. `make recover` (dry run by
+  default; `APPLY=1` writes) rebuilds orphaned or mispointed `references.json` entries
+  from it, and `make verify` / `make status` use it to explain discrepancies.
+- `json-output/*.json` - Working files for detection and fixes, including
+  `metadata_mismatches.json` (publisher/filename mismatches from `find-mismatches`)
 
 ## Important Notes
 
@@ -184,7 +228,8 @@ All metadata is stored in `references.json` (the source of truth). Other files a
 - ✅ Always run scripts through `make` targets (or `uv run python -m src.scripts...`)
 - ✅ Run `make verify` after making changes
 - ✅ Review conflict reports before manually fixing files
-- ✅ Set `suggested_*` fields to `null` (not empty strings) when no change needed
+- ✅ Set `suggested_*` fields to `null` (not empty strings) when no change needed —
+  except `suggested_publisher`, where `""` is a deliberate request to clear it
 
 ### DON'T:
 - ❌ Edit `references.json` or `references.md` manually (use the scripts)
@@ -204,7 +249,7 @@ make format
 make lint
 ```
 
-171 tests covering all core utilities plus integration tests for the processing and update pipelines.
+338 tests covering all core utilities plus integration tests for the processing and update pipelines.
 
 ## All Available Commands
 
@@ -221,9 +266,10 @@ Need fine-grained control? Run `make help` to see all commands:
 | Category | Example Commands |
 |----------|------------------|
 | **Core Processing** | `process`, `generate` |
-| **Detection** | `find-broken`, `find-unknown`, `detect-dups` |
-| **Updates** | `update-broken`, `update-unknown`, `update-dups`, `update-similar` |
+| **Detection** | `find-broken`, `find-unknown`, `detect-dups`, `find-mismatches` |
+| **Updates** | `update-broken`, `update-unknown`, `update-dups`, `update-similar`, `update-mismatches` |
 | **Verification** | `verify`, `validate` |
+| **Recovery** | `recover`, `quarantine-held` — dry run by default, `APPLY=1` writes/moves |
 | **Testing & QA** | `test`, `format`, `lint` |
 | **Utility** | `extract FILE=path` |
 
@@ -233,7 +279,22 @@ Need fine-grained control? Run `make help` to see all commands:
 A: Run `make status` - it will tell you exactly what needs attention and recommend next steps.
 
 **Q: Files remain in `todo/` after running `make ingest`**
-A: Check `json-output/ingestion_conflicts.json` - these files likely have hash conflicts or filename collisions with existing entries. Conflict detection is hash-based, not filename-based: a byte-identical duplicate is always held in `todo/`, even if it arrived in the same batch as its first copy, while a distinct file that merely shares a generated name is ingested and suffixed (`_2`, `_3`, ...). There is no automatic resolution step for a held duplicate - once you've confirmed it's really unwanted, delete it from `todo/` (or move it elsewhere) yourself.
+A: Check `json-output/ingestion_conflicts.json` — it's written on every run (an empty
+`conflicts` list when clean), so it always reflects the last ingest. Conflict detection is
+hash-based, not filename-based: a distinct file that merely shares a generated filename with
+an existing entry is ingested and suffixed (`_2`, `_3`, ...) and never held. A hash match is
+held as one of:
+- `hash_duplicate` — the matching entry's file is still present in `reference/`
+  (`existing_file_present: true`). Resolve with `make quarantine-held` (dry run by default;
+  `APPLY=1` moves) — it re-verifies the duplicate at move time and quarantines it, never
+  deleting or overwriting.
+- a silent relink (not a conflict) — if the matching entry's file is *missing* from
+  `reference/`, the incoming file is treated as that file's return and moved into place
+  under the entry's name.
+- `hash_matches_missing_file` — the matching entry's file is missing, but another file now
+  occupies its name, so restoring would overwrite that file; held for manual review.
+- `previously_quarantined` — the hash matches something quarantined earlier that's still in
+  `quarantine/`; re-ingesting would silently undo that removal, so it's held instead.
 
 **Q: How do I find and fix duplicates?**
 A: Run `make detect-all` to find all duplicates, then `make status` to see how many were found. Review the JSON files in `json-output/`, then run `make update-all` to apply your decisions.
