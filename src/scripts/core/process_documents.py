@@ -19,6 +19,7 @@ from src.lib import config
 
 # Import shared utilities
 from src.lib.utils import (
+    append_history,
     build_reference_entry,
     regenerate_references_md,
     load_references_json,
@@ -206,25 +207,40 @@ class DocumentProcessor:
                     f"Long filename ({len(new_filename)} chars): {file_path.name} -> {new_filename}"
                 )
 
-            # Move file from todo/ to reference/ (changed from copy)
-            dest_path = config.REFERENCE_DIR / new_filename
-            shutil.move(str(file_path), str(dest_path))
-
-            # Append to the in-memory references list (saved once at the end
-            # of run()) so later files in this batch see it immediately via
-            # self.existing_references, closing the within-batch duplicate
-            # window.
-            self.existing_references.append(
-                build_reference_entry(
-                    stub["author_names"],
-                    stub["year"],
-                    stub["title"],
-                    stub["publisher"],
-                    new_filename,
-                    original_filename=file_path.name,
-                    file_hash=stub["file_hash"],
-                )
+            # Build the entry up front and journal it *before* the move: if
+            # the run dies after the move but before references.json is
+            # saved, the history still holds everything needed to rebuild
+            # this entry (original name, new name, hash, metadata).
+            entry = build_reference_entry(
+                stub["author_names"],
+                stub["year"],
+                stub["title"],
+                stub["publisher"],
+                new_filename,
+                original_filename=file_path.name,
+                file_hash=stub["file_hash"],
             )
+            append_history("ingest", **entry)
+
+            # Move file from todo/ to reference/ (changed from copy).
+            # BaseException so a Ctrl-C landing on the move is journalled too.
+            dest_path = config.REFERENCE_DIR / new_filename
+            try:
+                shutil.move(str(file_path), str(dest_path))
+            except BaseException as e:
+                append_history(
+                    "ingest_failed",
+                    original_filename=file_path.name,
+                    filename=new_filename,
+                    file_hash=stub["file_hash"],
+                    error=str(e) or type(e).__name__,
+                )
+                raise
+
+            # Append to the in-memory references list so later files in
+            # this batch see it immediately via self.existing_references,
+            # closing the within-batch duplicate window.
+            self.existing_references.append(entry)
 
             # Record processing
             self.processed_files.append(
@@ -237,6 +253,10 @@ class DocumentProcessor:
                     "file_hash": stub["file_hash"],
                 }
             )
+
+            # Save after every file, not once at the end: an interrupted
+            # batch must not leave moved files with no references.json entry.
+            save_references_json(self.existing_references)
 
             return True
 
@@ -286,19 +306,40 @@ class DocumentProcessor:
         for f in non_pdf_files:
             self.skipped_non_pdf.append(f.name)
 
-        # Process small PDFs
-        for i, pdf_file in enumerate(small_pdfs, 1):
-            print(f"Processing {i}/{len(small_pdfs)}: {pdf_file.name}")
-            self.process_file(pdf_file)
+        # Process small PDFs. Each file saves references.json as it goes;
+        # the finally makes sure an interrupted batch (Ctrl-C is a
+        # BaseException, so no `except Exception` sees it) still gets its
+        # final save and its log before the interrupt propagates.
+        completed = False
+        try:
+            for i, pdf_file in enumerate(small_pdfs, 1):
+                print(f"Processing {i}/{len(small_pdfs)}: {pdf_file.name}")
+                self.process_file(pdf_file)
 
-            # Progress indicator
-            if i % 50 == 0:
-                print(f"  ... {i} files processed")
+                # Progress indicator
+                if i % 50 == 0:
+                    print(f"  ... {i} files processed")
+            completed = True
+        finally:
+            self._finish(completed)
 
-        # Save references.json once, then generate references.md from it
+    def _finish(self, completed: bool) -> None:
+        """Save, regenerate, and log -- on success and on interruption alike."""
+        if not completed:
+            print("\n⚠ Interrupted -- saving progress before exiting...")
+            self.log_entries.append(
+                "Run interrupted: files still in todo/ were not processed"
+            )
+
+        # Final save, then generate references.md from it
         if self.processed_files:
             print("Saving references.json...")
-            save_references_json(self.existing_references)
+            try:
+                save_references_json(self.existing_references)
+            except Exception as e:
+                # Don't let a failed save mask the interrupt (if any) that
+                # got us here; the per-file saves already persisted most of it.
+                self.errors.append(f"Error saving references.json: {e}")
             print("Generating references.md from JSON...")
             if regenerate_references_md():
                 print("  ✓ References.md generated successfully")
@@ -309,6 +350,11 @@ class DocumentProcessor:
         print("Writing log...")
         with open(config.MARKDOWN_DIR / "log.md", "w", encoding="utf-8") as f:
             f.write("# Document Processing Log\n\n")
+            if not completed:
+                f.write(
+                    "**Interrupted**: this run stopped early. Files still in "
+                    "todo/ were not processed.\n\n"
+                )
             f.write("## Summary\n\n")
             f.write(f"- **Total PDFs processed**: {len(self.processed_files)}\n")
             f.write(
@@ -318,6 +364,12 @@ class DocumentProcessor:
             f.write(f"- **Non-PDF files skipped**: {len(self.skipped_non_pdf)}\n")
             f.write(f"- **Errors encountered**: {len(self.errors)}\n")
             f.write(f"- **Issues logged**: {len(self.log_entries)}\n\n")
+
+            if self.processed_files:
+                f.write("## Ingested Files\n\n")
+                for p in self.processed_files:
+                    f.write(f"- {p['original_filename']} → {p['new_filename']}\n")
+                f.write("\n")
 
             if self.conflicts:
                 f.write("## Files with Conflicts (Kept in todo/)\n\n")
@@ -365,7 +417,10 @@ class DocumentProcessor:
                 json.dump(conflict_report, f, indent=2, ensure_ascii=False)
             print(f"  Conflict report written to: {conflict_file}")
 
-        print("\n✓ Processing complete!")
+        if completed:
+            print("\n✓ Processing complete!")
+        else:
+            print("\n✗ Processing interrupted -- progress so far is saved.")
         print(f"  - Processed: {len(self.processed_files)} files")
         print(f"  - Conflicts: {len(self.conflicts)} files (kept in todo/)")
         print(f"  - Skipped (large): {len(self.skipped_large)} files")

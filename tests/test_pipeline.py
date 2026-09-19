@@ -511,3 +511,72 @@ class TestDocumentProcessor:
         assert new_entry["file_hash"] == hashlib.sha256(incoming_content).hexdigest()
         assert (sandbox["reference"] / "Smith_Great_Findings_2.pdf").exists()
         assert not (sandbox["reference"] / "Smith_Great_Findings.pdf").exists()
+
+    def test_interrupt_mid_batch_keeps_progress(self, sandbox, monkeypatch):
+        """Ctrl-C partway through a batch used to leave already-moved files
+        renamed in reference/ with no references.json entry and no log --
+        their original names were gone. Now each file is journalled before
+        its move and saved after it, and the log is still written."""
+        utils.save_references_json([])
+        for i in range(1, 6):
+            (sandbox["todo"] / f"file{i}.pdf").write_bytes(
+                make_pdf_bytes(f"Paper Number {i}", "Jane Smith", "2020")
+            )
+
+        import src.scripts.core.process_documents as pd
+
+        real_move = pd.shutil.move
+        calls = {"n": 0}
+
+        def move_then_interrupt(src, dst):
+            calls["n"] += 1
+            if calls["n"] == 3:
+                raise KeyboardInterrupt
+            return real_move(src, dst)
+
+        monkeypatch.setattr(
+            "src.scripts.core.process_documents.shutil.move", move_then_interrupt
+        )
+
+        with pytest.raises(KeyboardInterrupt):
+            DocumentProcessor().run()
+
+        entries = utils.load_references_json()
+        assert [e["original_filename"] for e in entries] == ["file1.pdf", "file2.pdf"]
+        assert all(e["file_hash"] for e in entries)
+        for e in entries:
+            assert (sandbox["reference"] / e["filename"]).exists()
+        for i in range(3, 6):
+            assert (sandbox["todo"] / f"file{i}.pdf").exists()
+
+        log = (sandbox["markdown"] / "log.md").read_text()
+        assert "Interrupted" in log
+        assert "file1.pdf → " in log and "file2.pdf → " in log
+
+        # Every attempted move is journalled, including the one interrupted
+        # (its intent is recorded before the move, its failure after).
+        history = utils.load_history()
+        ingests = [h for h in history if h["event"] == "ingest"]
+        assert [h["original_filename"] for h in ingests] == [
+            "file1.pdf",
+            "file2.pdf",
+            "file3.pdf",
+        ]
+        failed = [h for h in history if h["event"] == "ingest_failed"]
+        assert [h["original_filename"] for h in failed] == ["file3.pdf"]
+        assert failed[0]["error"] == "KeyboardInterrupt"
+
+    def test_ingest_event_carries_the_full_entry(self, sandbox):
+        """The journalled ingest event holds exactly the references.json
+        entry, so a lost entry can be rebuilt from the event alone."""
+        utils.save_references_json([])
+        (sandbox["todo"] / "download.pdf").write_bytes(
+            make_pdf_bytes("Great Findings", "Jane Smith", "2020")
+        )
+
+        DocumentProcessor().run()
+
+        [entry] = utils.load_references_json()
+        [event] = utils.load_history()
+        assert event["event"] == "ingest"
+        assert {k: event[k] for k in entry} == entry
