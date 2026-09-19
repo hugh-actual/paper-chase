@@ -3,7 +3,13 @@
 
 # Import configuration from config.py
 from src.lib import config
-from src.lib.utils import load_references_json, is_suspect_filename
+from src.lib.utils import (
+    calculate_file_hash,
+    is_suspect_filename,
+    load_history,
+    load_references_json,
+)
+from src.scripts.utilities.recover_orphans import explain_orphan
 
 
 def _verify() -> int:
@@ -54,8 +60,25 @@ def _verify() -> int:
         print(
             f"\n⚠️  FILES IN FOLDER BUT NOT IN BIBLIOGRAPHY ({len(files_not_in_bib)}):"
         )
+        # The history journal usually knows what an orphan was called
+        # before ingest renamed it, and `make recover` can rebuild its entry.
+        history = load_history()
+        recoverable = 0
         for f in sorted(files_not_in_bib):
-            print(f"  - {f}")
+            event = explain_orphan(
+                history, f, calculate_file_hash(config.REFERENCE_DIR / f)
+            )
+            if event:
+                recoverable += 1
+                origin = event.get("original_filename") or "unknown"
+                print(f"  - {f}  (originally: {origin})")
+            else:
+                print(f"  - {f}")
+        if recoverable:
+            print(
+                f"  → {recoverable} can be rebuilt from history: run 'make recover' "
+                "to preview, 'make recover APPLY=1' to apply"
+            )
     else:
         print("\n✓ All files in folder are in bibliography")
 
@@ -65,6 +88,10 @@ def _verify() -> int:
         )
         for f in sorted(bib_not_in_files):
             print(f"  - {f}")
+        print(
+            "  → if an interrupted rename or quarantine moved these, "
+            "'make recover' can fix the entries"
+        )
     else:
         print("\n✓ All bibliography entries have corresponding files")
 

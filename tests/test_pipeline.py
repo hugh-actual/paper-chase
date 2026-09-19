@@ -805,3 +805,201 @@ class TestVerifyFilesAndMetadata:
         assert len(utils.load_references_json()) == 4
         backup = sandbox["references_json"].with_name("references.json.bak")
         assert backup.read_bytes() == pre_run
+
+
+def write_history(sandbox, *events):
+    """Append hand-written history events (for event types other scripts
+    produce), one JSON line each."""
+    with open(sandbox["history"], "a", encoding="utf-8") as f:
+        for event in events:
+            f.write(json.dumps(event) + "\n")
+
+
+class TestRecoverOrphans:
+    def _ingest(self, sandbox, count):
+        utils.save_references_json([])
+        for i in range(1, count + 1):
+            (sandbox["todo"] / f"file{i}.pdf").write_bytes(
+                make_pdf_bytes(f"Paper Number {i}", "Jane Smith", "2020")
+            )
+        DocumentProcessor().run()
+        return utils.load_references_json()
+
+    def test_restores_entries_lost_by_interrupted_batch(self, sandbox):
+        """Files moved into reference/ whose entries never reached
+        references.json are rebuilt exactly from their ingest events."""
+        from src.scripts.utilities import recover_orphans
+
+        entries = self._ingest(sandbox, 2)
+        assert len(entries) == 2
+        # The crash: files are in reference/, references.json is pre-run.
+        utils.save_references_json([])
+
+        assert recover_orphans.main([]) == 0  # dry run
+        assert utils.load_references_json() == []
+
+        assert recover_orphans.main(["--apply"]) == 0
+        recovered = utils.load_references_json()
+        key = lambda e: e["filename"]  # noqa: E731
+        assert sorted(recovered, key=key) == sorted(entries, key=key)
+        assert all(e["original_filename"].startswith("file") for e in recovered)
+        assert entries[0]["filename"] in sandbox["references_md"].read_text()
+
+    def test_hash_must_match(self, sandbox):
+        """A file sitting at a journalled name but with different content
+        is not the file the event describes -- leave it unresolved."""
+        from src.scripts.utilities import recover_orphans
+
+        [entry] = self._ingest(sandbox, 1)
+        utils.save_references_json([])
+        (sandbox["reference"] / entry["filename"]).write_bytes(b"other content")
+
+        plan = recover_orphans.plan_recovery([], utils.load_history())
+        assert plan["restored"] == []
+        assert plan["unresolved"] == [entry["filename"]]
+
+    def test_latest_matching_event_wins(self, sandbox):
+        from src.scripts.utilities import recover_orphans
+
+        path = sandbox["reference"] / "Smith_Paper.pdf"
+        path.write_bytes(b"content")
+        file_hash = utils.calculate_file_hash(path)
+        base = {"filename": "Smith_Paper.pdf", "file_hash": file_hash}
+        write_history(
+            sandbox,
+            {
+                "event": "ingest",
+                **base,
+                "author": "J Smith",
+                "title": "Old",
+                "year": "2020",
+                "publisher": "",
+                "original_filename": "dl.pdf",
+            },
+            {
+                "event": "rename",
+                "old_filename": "Smith_Paper.pdf",
+                **base,
+                "author": "Jane Smith",
+                "title": "Paper",
+                "year": "2021",
+            },
+        )
+
+        plan = recover_orphans.plan_recovery([], utils.load_history())
+        [entry] = plan["restored"]
+        assert entry["author"] == "Jane Smith"
+        assert entry["year"] == "2021"
+        # Not in the rename event: inherited from the earlier ingest
+        assert entry["original_filename"] == "dl.pdf"
+
+    def test_missing_file_explained_by_rename(self, sandbox):
+        """An update step renamed the file but died before saving
+        references.json: the entry is pointed at the new name, and the
+        renamed file isn't also restored as a second entry."""
+        from src.scripts.utilities import recover_orphans
+
+        new = sandbox["reference"] / "Smith_New_Title.pdf"
+        new.write_bytes(b"content")
+        file_hash = utils.calculate_file_hash(new)
+        entry = {
+            "author": "Jane Smith",
+            "year": "2020",
+            "title": "Old Title",
+            "publisher": "",
+            "filename": "Smith_Old_Title.pdf",
+            "original_filename": "dl.pdf",
+            "file_hash": file_hash,
+        }
+        utils.save_references_json([entry])
+        write_history(
+            sandbox,
+            {
+                "event": "rename",
+                "old_filename": "Smith_Old_Title.pdf",
+                "filename": "Smith_New_Title.pdf",
+                "file_hash": file_hash,
+                "author": "Jane Smith",
+                "title": "New Title",
+                "year": "2020",
+            },
+        )
+
+        assert recover_orphans.main(["--apply"]) == 0
+
+        [fixed] = utils.load_references_json()
+        assert fixed["filename"] == "Smith_New_Title.pdf"
+        assert fixed["title"] == "New Title"
+        assert fixed["original_filename"] == "dl.pdf"
+
+    def test_missing_file_explained_by_quarantine(self, sandbox):
+        from src.scripts.utilities import recover_orphans
+
+        entry = {
+            "author": "Jane Smith",
+            "year": "2020",
+            "title": "Dup",
+            "publisher": "",
+            "filename": "Smith_Dup.pdf",
+            "file_hash": "abc",
+        }
+        utils.save_references_json([entry])
+        (sandbox["quarantine"] / "Smith_Dup_2.pdf").write_bytes(b"x")
+        write_history(
+            sandbox,
+            {"event": "quarantine", **entry, "quarantine_filename": "Smith_Dup_2.pdf"},
+        )
+
+        assert recover_orphans.main(["--apply"]) == 0
+        assert utils.load_references_json() == []
+
+    def test_unexplained_missing_file_is_left_alone(self, sandbox):
+        from src.scripts.utilities import recover_orphans
+
+        entry = {
+            "author": "Jane Smith",
+            "year": "2020",
+            "title": "Gone",
+            "publisher": "",
+            "filename": "Smith_Gone.pdf",
+            "file_hash": "abc",
+        }
+        utils.save_references_json([entry])
+
+        assert recover_orphans.main(["--apply"]) == 0
+        assert utils.load_references_json() == [entry]
+
+    def test_tolerates_malformed_history_lines(self, sandbox):
+        from src.scripts.utilities import recover_orphans
+
+        [entry] = self._ingest(sandbox, 1)
+        utils.save_references_json([])
+        with open(sandbox["history"], "a", encoding="utf-8") as f:
+            f.write('{"event": "ing\n')
+
+        assert recover_orphans.main(["--apply"]) == 0
+        assert utils.load_references_json() == [entry]
+
+    def test_failed_save_exits_nonzero(self, sandbox, monkeypatch):
+        from src.scripts.utilities import recover_orphans
+
+        self._ingest(sandbox, 1)
+        utils.save_references_json([])
+
+        def boom(entries):
+            raise OSError("simulated disk full")
+
+        monkeypatch.setattr(recover_orphans, "save_references_json", boom)
+        assert recover_orphans.main(["--apply"]) == 1
+
+    def test_verify_names_original_and_suggests_recover(self, sandbox, capsys):
+        from src.scripts.core import verify_files_and_metadata
+
+        self._ingest(sandbox, 1)
+        utils.save_references_json([])
+        capsys.readouterr()
+
+        assert verify_files_and_metadata.main() == 1
+        out = capsys.readouterr().out
+        assert "(originally: file1.pdf)" in out
+        assert "make recover" in out

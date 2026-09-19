@@ -2,7 +2,7 @@
         process generate \
         find-broken find-unknown detect-dups \
         update-broken update-unknown update-dups update-similar \
-        verify validate \
+        verify validate recover \
         test format lint extract
 
 # Default target
@@ -33,6 +33,7 @@ help:
 	@echo "Verification:"
 	@echo "  make verify         Check files vs metadata consistency"
 	@echo "  make validate       Validate references.json matches references.md"
+	@echo "  make recover        Rebuild entries from history (dry run; APPLY=1 writes)"
 	@echo ""
 	@echo "Testing & QA:"
 	@echo "  make test           Run pytest"
@@ -94,6 +95,9 @@ verify:
 
 validate:
 	uv run python -m src.scripts.utilities.validate_references_json
+
+recover:
+	uv run python -m src.scripts.utilities.recover_orphans $(if $(APPLY),--apply,)
 
 # Testing & QA
 test:

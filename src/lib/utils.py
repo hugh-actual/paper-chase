@@ -321,6 +321,17 @@ def load_history():
     return events
 
 
+def latest_history_event(history, events, **match):
+    """Return the most recent event in `history` whose type is in `events`
+    and whose fields equal every `match` key/value, or None."""
+    for record in reversed(history):
+        if record.get("event") in events and all(
+            record.get(k) == v for k, v in match.items()
+        ):
+            return record
+    return None
+
+
 def build_reference_entry(
     author_names,
     year,
