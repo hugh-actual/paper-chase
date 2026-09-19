@@ -65,6 +65,7 @@ def sandbox(tmp_path, monkeypatch):
         "JSON_OUTPUT_DIR": dirs["json_output"],
         "REFERENCES_JSON": references_json,
         "REFERENCES_FILE": references_md,
+        "HISTORY_FILE": tmp_path / "history.jsonl",
     }
     for name, value in overrides.items():
         monkeypatch.setattr(config, name, value)
@@ -73,6 +74,7 @@ def sandbox(tmp_path, monkeypatch):
         **dirs,
         "references_json": references_json,
         "references_md": references_md,
+        "history": tmp_path / "history.jsonl",
     }
 
 

@@ -10,6 +10,7 @@ import re
 import json
 import os
 import shutil
+from datetime import datetime, timezone
 from difflib import SequenceMatcher
 from pathlib import Path
 from typing import Optional
@@ -250,6 +251,68 @@ def save_references_json(entries):
         backup = config.REFERENCES_JSON.with_name(config.REFERENCES_JSON.name + ".bak")
         shutil.copy2(config.REFERENCES_JSON, backup)
     _atomic_write_text(config.REFERENCES_JSON, text)
+
+
+def append_history(event, **fields):
+    """Append one event to the history journal (config.HISTORY_FILE).
+
+    The journal is the durable record of what happened to each file --
+    written *before* a move, so even a crash between the move and the next
+    references.json save leaves the original name and hash recoverable.
+    It is append-only: nothing ever rewrites it.
+
+    Each event is one JSON line carrying `event`, a UTC `ts`, and `fields`.
+    It is flushed and fsynced before returning.
+    """
+    record = {
+        "event": event,
+        "ts": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+        **fields,
+    }
+    line = (json.dumps(record, ensure_ascii=False) + "\n").encode("utf-8")
+
+    # Binary so the one-byte look-behind below can't land mid-character.
+    # Append mode sends every write to the end regardless of the seek.
+    with open(config.HISTORY_FILE, "ab+") as f:
+        # A previous append torn mid-line (power loss) would otherwise have
+        # this record glued onto it, losing both. Start a fresh line instead;
+        # load_history() then reports the torn fragment rather than hiding it.
+        f.seek(0, os.SEEK_END)
+        if f.tell() > 0:
+            f.seek(-1, os.SEEK_END)
+            if f.read(1) != b"\n":
+                line = b"\n" + line
+        f.write(line)
+        f.flush()
+        os.fsync(f.fileno())
+
+
+def load_history():
+    """Load every event from the history journal, oldest first.
+
+    A malformed *final* line is an append interrupted mid-write and is
+    skipped. A malformed line anywhere else means the journal is corrupt
+    (or an earlier torn append was followed by later ones), so that raises
+    -- silently dropping a record from the middle would hide lost data.
+    Returns [] if the journal doesn't exist yet.
+    """
+    if not config.HISTORY_FILE.exists():
+        return []
+
+    lines = config.HISTORY_FILE.read_text(encoding="utf-8").splitlines()
+    events = []
+    for i, line in enumerate(lines):
+        if not line.strip():
+            continue
+        try:
+            events.append(json.loads(line))
+        except json.JSONDecodeError as e:
+            if i == len(lines) - 1:
+                break
+            raise ValueError(
+                f"{config.HISTORY_FILE}: malformed history line {i + 1}: {e}"
+            ) from e
+    return events
 
 
 def build_reference_entry(

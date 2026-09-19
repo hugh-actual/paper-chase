@@ -16,6 +16,7 @@ _ENV_KEYS = (
     "MARKDOWN_DIR",
     "REFERENCES_FILE",
     "REFERENCES_JSON",
+    "HISTORY_FILE",
     "JSON_OUTPUT_DIR",
 )
 
@@ -73,6 +74,7 @@ class TestExpandUser:
             DOCS_BASE_DIR="~/documents",
             REFERENCE_DIR="~/documents/reference",
             JSON_OUTPUT_DIR="~/documents/json-output",
+            HISTORY_FILE="~/documents/history.jsonl",
         ) as reloaded:
             assert "~" not in str(reloaded.REFERENCE_DIR)
             assert str(reloaded.REFERENCE_DIR) == str(
@@ -81,6 +83,9 @@ class TestExpandUser:
             assert "~" not in str(reloaded.JSON_OUTPUT_DIR)
             assert str(reloaded.JSON_OUTPUT_DIR) == str(
                 tmp_path / "documents" / "json-output"
+            )
+            assert str(reloaded.HISTORY_FILE) == str(
+                tmp_path / "documents" / "history.jsonl"
             )
             # An unexpanded "~/..." is a *relative* path, so mkdir lands it
             # under the CWD (the repo root), not under HOME -- that stray

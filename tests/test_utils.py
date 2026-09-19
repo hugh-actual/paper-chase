@@ -1232,3 +1232,77 @@ class TestCreateReferenceStub:
 
         assert stub["filename"].startswith("Unknown_")
         assert stub["author"] == "Unknown"
+
+
+# =============================================================================
+# Tests for the history journal
+# =============================================================================
+
+
+class TestHistoryJournal:
+    """Tests for append_history() / load_history()."""
+
+    @pytest.fixture
+    def history_file(self, tmp_path, monkeypatch):
+        path = tmp_path / "history.jsonl"
+        monkeypatch.setattr(config, "HISTORY_FILE", path)
+        return path
+
+    def test_missing_file_loads_empty(self, history_file):
+        from src.lib.utils import load_history
+
+        assert load_history() == []
+
+    def test_append_and_load_round_trip(self, history_file):
+        from src.lib.utils import append_history, load_history
+
+        append_history("ingest", original_filename="dl.pdf", filename="Doe_A.pdf")
+        append_history("ingest", original_filename="Über.pdf", filename="Roe_B.pdf")
+
+        lines = history_file.read_text(encoding="utf-8").splitlines()
+        assert len(lines) == 2
+        assert "Über" in lines[1], "non-ASCII must be stored unescaped"
+
+        events = load_history()
+        assert [e["filename"] for e in events] == ["Doe_A.pdf", "Roe_B.pdf"]
+        assert events[0]["event"] == "ingest"
+        assert events[0]["original_filename"] == "dl.pdf"
+        # ISO-8601 in UTC
+        assert events[0]["ts"].endswith("+00:00")
+
+    def test_truncated_final_line_is_skipped(self, history_file):
+        """An append interrupted mid-write leaves a partial last line."""
+        from src.lib.utils import append_history, load_history
+
+        append_history("ingest", filename="Doe_A.pdf")
+        with open(history_file, "a", encoding="utf-8") as f:
+            f.write('{"event": "ingest", "filena')
+
+        events = load_history()
+        assert [e["filename"] for e in events] == ["Doe_A.pdf"]
+
+    def test_malformed_middle_line_raises(self, history_file):
+        """Only the final line may be malformed; anything earlier is
+        corruption and must not be silently dropped."""
+        from src.lib.utils import append_history, load_history
+
+        append_history("ingest", filename="Doe_A.pdf")
+        with open(history_file, "a", encoding="utf-8") as f:
+            f.write("not json\n")
+        append_history("ingest", filename="Roe_B.pdf")
+
+        with pytest.raises(ValueError, match="line 2"):
+            load_history()
+
+    def test_append_after_torn_line_starts_fresh_line(self, history_file):
+        """A new event must not be glued onto a torn fragment -- that would
+        lose the new event as well."""
+        from src.lib.utils import append_history
+
+        append_history("ingest", filename="Doe_A.pdf")
+        with open(history_file, "a", encoding="utf-8") as f:
+            f.write('{"event": "ing')
+        append_history("ingest", filename="Roe_B.pdf")
+
+        last = history_file.read_text(encoding="utf-8").splitlines()[-1]
+        assert json.loads(last)["filename"] == "Roe_B.pdf"
