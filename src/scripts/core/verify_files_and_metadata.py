@@ -6,7 +6,8 @@ from src.lib import config
 from src.lib.utils import load_references_json, is_suspect_filename
 
 
-def main():
+def _verify() -> int:
+    """Run verification and return discrepancy count."""
     # Get all PDF files
     pdf_files = set(f.name for f in config.REFERENCE_DIR.glob("*.pdf"))
     print(f"Found {len(pdf_files)} PDF files in reference folder")
@@ -84,6 +85,11 @@ def main():
     return len(files_not_in_bib) + len(bib_not_in_files)
 
 
+def main() -> int:
+    """Entry point: return 0 if no discrepancies, 1 if any found."""
+    discrepancy_count = _verify()
+    return 1 if discrepancy_count else 0
+
+
 if __name__ == "__main__":
-    exit_code = main()
-    exit(exit_code)
+    exit(main())

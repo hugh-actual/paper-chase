@@ -722,3 +722,66 @@ class TestDocumentProcessor:
         with pytest.raises(KeyboardInterrupt):
             processor.run()
         assert any("log.md" in e.message for e in processor.fatal_errors)
+
+
+class TestVerifyFilesAndMetadata:
+    """Tests for verify_files_and_metadata.py exit codes.
+
+    The bug: main() returned the discrepancy count directly as the exit code,
+    so 256 discrepancies wrapped to 0 (success). Fixed to return 1 if count > 0.
+    """
+
+    def test_verify_returns_zero_for_clean_collection(self, sandbox):
+        """Clean sandbox with no discrepancies should return exit code 0."""
+        # Create empty references.json
+        utils.save_references_json([])
+
+        # Import and call verify's main function
+        from src.scripts.core.verify_files_and_metadata import main
+
+        exit_code = main()
+        assert exit_code == 0
+
+    def test_verify_returns_one_for_missing_files(self, sandbox):
+        """When references.json has entries but files don't exist, exit code is 1."""
+        # Create 256 references.json entries with missing files
+        entries = [
+            {
+                "author": f"Author {i}",
+                "year": "2020",
+                "title": f"Title {i}",
+                "publisher": "",
+                "filename": f"Author_{i}_Title_{i}.pdf",
+                "file_hash": hashlib.sha256(f"content-{i}".encode()).hexdigest(),
+            }
+            for i in range(256)
+        ]
+        utils.save_references_json(entries)
+
+        # Import and call verify's main function
+        from src.scripts.core.verify_files_and_metadata import main
+
+        exit_code = main()
+        # 256 discrepancies: should return 1, not 0 (mod 256 wrap bug)
+        assert exit_code == 1
+
+    def test_verify_returns_one_for_small_discrepancy(self, sandbox):
+        """Any discrepancy count > 0 should return exit code 1."""
+        # Create 1 reference.json entry with missing file
+        entries = [
+            {
+                "author": "John Doe",
+                "year": "2020",
+                "title": "Sample Paper",
+                "publisher": "",
+                "filename": "Doe_Sample_Paper.pdf",
+                "file_hash": hashlib.sha256(b"content").hexdigest(),
+            }
+        ]
+        utils.save_references_json(entries)
+
+        # Import and call verify's main function
+        from src.scripts.core.verify_files_and_metadata import main
+
+        exit_code = main()
+        assert exit_code == 1
