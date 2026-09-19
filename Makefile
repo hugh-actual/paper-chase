@@ -2,7 +2,7 @@
         process generate \
         find-broken find-unknown detect-dups \
         update-broken update-unknown update-dups update-similar \
-        verify validate recover \
+        verify validate recover quarantine-held \
         test format lint extract
 
 # Default target
@@ -34,6 +34,7 @@ help:
 	@echo "  make verify         Check files vs metadata consistency"
 	@echo "  make validate       Validate references.json matches references.md"
 	@echo "  make recover        Rebuild entries from history (dry run; APPLY=1 writes)"
+	@echo "  make quarantine-held  Move held duplicates from todo/ to quarantine/ (APPLY=1)"
 	@echo ""
 	@echo "Testing & QA:"
 	@echo "  make test           Run pytest"
@@ -98,6 +99,9 @@ validate:
 
 recover:
 	uv run python -m src.scripts.utilities.recover_orphans $(if $(APPLY),--apply,)
+
+quarantine-held:
+	uv run python -m src.scripts.utilities.quarantine_held $(if $(APPLY),--apply,)
 
 # Testing & QA
 test:

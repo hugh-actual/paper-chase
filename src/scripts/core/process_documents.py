@@ -28,7 +28,7 @@ from src.lib.utils import (
     save_references_json,
     create_reference_stub,
     check_hash_conflict,
-    check_filename_conflict,
+    _atomic_write_text,
 )
 
 # Configuration
@@ -319,21 +319,9 @@ class DocumentProcessor:
                 }
             )
 
-        filename_conflict = check_filename_conflict(
-            stub["filename"], self.existing_references
-        )
-        if filename_conflict:
-            conflicts.append(
-                {
-                    "type": "filename_collision",
-                    "existing_filename": filename_conflict["filename"],
-                    "existing_title": filename_conflict.get("title", ""),
-                    "message": (
-                        f"Filename would collide with existing: "
-                        f"{filename_conflict['filename']}"
-                    ),
-                }
-            )
+        # No filename-collision check: create_reference_stub already
+        # suffixes the name against every existing entry and this batch, so
+        # a colliding name can't reach here.
 
         return conflicts, None
 
@@ -594,16 +582,27 @@ class DocumentProcessor:
                 f.write("\n")
 
     def _write_conflict_report(self) -> None:
-        """Write json-output/ingestion_conflicts.json if there are conflicts."""
+        """Write json-output/ingestion_conflicts.json -- always, so a clean
+        run replaces a previous run's report instead of leaving it stale."""
+        conflict_report = {
+            "generated": datetime.now().isoformat(),
+            "conflicts": self.conflicts,
+        }
+        conflict_file = config.JSON_OUTPUT_DIR / "ingestion_conflicts.json"
+        _atomic_write_text(
+            conflict_file, json.dumps(conflict_report, indent=2, ensure_ascii=False)
+        )
         if self.conflicts:
-            conflict_report = {
-                "generated": datetime.now().isoformat(),
-                "conflicts": self.conflicts,
-            }
-            conflict_file = config.JSON_OUTPUT_DIR / "ingestion_conflicts.json"
-            with open(conflict_file, "w", encoding="utf-8") as f:
-                json.dump(conflict_report, f, indent=2, ensure_ascii=False)
             print(f"  Conflict report written to: {conflict_file}")
+            if any(
+                c["type"] == "hash_duplicate"
+                for item in self.conflicts
+                for c in item["conflicts"]
+            ):
+                print(
+                    "  Held duplicates: 'make quarantine-held' previews moving "
+                    "them to quarantine/ (APPLY=1 to move)"
+                )
 
 
 def main():

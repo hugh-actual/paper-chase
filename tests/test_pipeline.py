@@ -1082,3 +1082,97 @@ class TestOrphanAwareHashConflicts:
         [conflict] = processor.conflicts[0]["conflicts"]
         assert conflict["type"] == "hash_matches_missing_file"
         assert conflict["existing_file_present"] is False
+
+
+class TestHeldConflicts:
+    def _hold_duplicate(self, sandbox, name="dup.pdf"):
+        existing = seed_entry(
+            sandbox, "Doe_Existing_Paper.pdf", "Jane Doe", "Existing Paper"
+        )
+        utils.save_references_json([existing])
+        held = sandbox["todo"] / name
+        held.write_bytes(DUMMY_PDF)
+        DocumentProcessor().run()
+        assert held.exists()
+        return held
+
+    def test_clean_run_replaces_stale_report(self, sandbox):
+        held = self._hold_duplicate(sandbox)
+        report_file = sandbox["json_output"] / "ingestion_conflicts.json"
+        assert len(json.loads(report_file.read_text())["conflicts"]) == 1
+
+        held.unlink()
+        DocumentProcessor().run()
+
+        assert json.loads(report_file.read_text())["conflicts"] == []
+
+    def test_quarantine_held_dry_run_then_apply(self, sandbox):
+        from src.scripts.utilities import quarantine_held
+
+        held = self._hold_duplicate(sandbox)
+        # A same-named file already in quarantine/ must not be overwritten
+        (sandbox["quarantine"] / "dup.pdf").write_bytes(b"earlier")
+
+        assert quarantine_held.main([]) == 0
+        assert held.exists(), "dry run must not move anything"
+
+        assert quarantine_held.main(["--apply"]) == 0
+        assert not held.exists()
+        assert (sandbox["quarantine"] / "dup.pdf").read_bytes() == b"earlier"
+        assert (sandbox["quarantine"] / "dup_2.pdf").read_bytes() == DUMMY_PDF
+        assert (sandbox["reference"] / "Doe_Existing_Paper.pdf").exists()
+
+        event = utils.load_history()[-1]
+        assert event["event"] == "quarantine_held"
+        assert event["original_filename"] == "dup.pdf"
+        assert event["quarantine_filename"] == "dup_2.pdf"
+
+    def test_refuses_when_existing_copy_missing(self, sandbox):
+        from src.scripts.utilities import quarantine_held
+
+        held = self._hold_duplicate(sandbox)
+        (sandbox["reference"] / "Doe_Existing_Paper.pdf").unlink()
+
+        assert quarantine_held.main(["--apply"]) == 0
+        assert held.exists()
+        assert list(sandbox["quarantine"].iterdir()) == []
+
+    def test_refuses_when_existing_copy_differs(self, sandbox):
+        from src.scripts.utilities import quarantine_held
+
+        held = self._hold_duplicate(sandbox)
+        (sandbox["reference"] / "Doe_Existing_Paper.pdf").write_bytes(b"changed")
+
+        assert quarantine_held.main(["--apply"]) == 0
+        assert held.exists()
+        assert list(sandbox["quarantine"].iterdir()) == []
+
+    def test_move_failure_exits_nonzero(self, sandbox, monkeypatch):
+        from src.scripts.utilities import quarantine_held
+
+        held = self._hold_duplicate(sandbox)
+
+        def boom(src, dst):
+            raise OSError("simulated move failure")
+
+        monkeypatch.setattr(quarantine_held.shutil, "move", boom)
+
+        assert quarantine_held.main(["--apply"]) == 1
+        assert held.exists()
+
+    def test_status_reports_todo_and_held(self, sandbox, capsys):
+        from src.scripts.utilities import status
+
+        self._hold_duplicate(sandbox)
+        (sandbox["todo"] / "new.pdf").write_bytes(b"%PDF-1.4 new\n%%EOF\n")
+
+        assert status.check_todo() == {
+            "todo": 2,
+            "held_duplicates": 1,
+            "held_other": 0,
+            "report_timestamp": "today",
+        }
+        status.main()
+        out = capsys.readouterr().out
+        assert "make ingest" in out
+        assert "make quarantine-held" in out

@@ -139,6 +139,36 @@ def check_duplicate_candidates() -> dict:
     }
 
 
+def check_todo() -> dict:
+    """Count PDFs waiting in todo/, and which of them the last ingest held
+    back (from ingestion_conflicts.json, limited to files still there)."""
+    todo_pdfs = {
+        f.name for f in config.TODO_DIR.glob("*") if f.suffix.lower() == ".pdf"
+    }
+
+    held_duplicates = 0
+    held_other = 0
+    report_file = config.JSON_OUTPUT_DIR / "ingestion_conflicts.json"
+    if report_file.exists():
+        with open(report_file, "r", encoding="utf-8") as f:
+            report = json.load(f)
+        for item in report.get("conflicts", []):
+            if item.get("original_filename") not in todo_pdfs:
+                continue
+            types = {c.get("type") for c in item.get("conflicts", [])}
+            if "hash_duplicate" in types:
+                held_duplicates += 1
+            else:
+                held_other += 1
+
+    return {
+        "todo": len(todo_pdfs),
+        "held_duplicates": held_duplicates,
+        "held_other": held_other,
+        "report_timestamp": format_timestamp(report_file),
+    }
+
+
 def main():
     """Display collection status and recommendations."""
     print("=" * 70)
@@ -150,6 +180,18 @@ def main():
     refs_timestamp = format_timestamp(config.REFERENCES_JSON)
     print(f"\n📚 Collection: {len(references)} entries")
     print(f"   Last modified: {refs_timestamp}")
+
+    todo = check_todo()
+    held = todo["held_duplicates"] + todo["held_other"]
+    print(f"\n📥 todo/: {todo['todo']} PDFs waiting")
+    if held:
+        print(f"   - {held} held by the last ingest ({todo['report_timestamp']})")
+        if todo["held_duplicates"]:
+            print(f"     {todo['held_duplicates']} exact duplicates of existing files")
+        if todo["held_other"]:
+            print(
+                f"     {todo['held_other']} other conflicts (see ingestion_conflicts.json)"
+            )
 
     # Detection files status
     print("\n📊 Detection Results:")
@@ -192,6 +234,21 @@ def main():
     print("\n💡 Recommendations:")
 
     recommendations = []
+
+    if todo["todo"] > held:
+        recommendations.append(
+            f"Run 'make ingest' to process {todo['todo'] - held} new PDFs in todo/"
+        )
+    if todo["held_duplicates"]:
+        recommendations.append(
+            f"Run 'make quarantine-held' to review moving {todo['held_duplicates']} "
+            "held duplicates to quarantine/ (APPLY=1 to move)"
+        )
+    if todo["held_other"]:
+        recommendations.append(
+            f"Review {todo['held_other']} held files in "
+            "json-output/ingestion_conflicts.json"
+        )
 
     # Check for unannotated detection results
     if similar["exists"] and similar["total_files"] > 0:
