@@ -286,6 +286,221 @@ class TestUpdateStep:
         assert "simulated rename failure" not in skipped
 
 
+def write_annotations(sandbox, annotations):
+    input_file = sandbox["json_output"] / SimpleStep.input_filename
+    input_file.write_text(json.dumps(annotations))
+
+
+class TestUpdateStepJournal:
+    """Quarantines and renames are journalled before the file moves, never
+    overwrite anything, and an interrupted run still saves its progress."""
+
+    def test_quarantine_never_overwrites_and_journals_the_entry(self, sandbox):
+        # A file of the same name is already in quarantine/ from earlier
+        seeded = sandbox["quarantine"] / "Doe_Thing.pdf"
+        seeded.write_bytes(b"seeded")
+
+        quarantined_names = []
+        for content in (b"first", b"second"):
+            entry = seed_entry(
+                sandbox, "Doe_Thing.pdf", "Jane Doe", "Thing", content=content
+            )
+            entry["original_filename"] = "download.pdf"
+            utils.save_references_json([entry])
+            write_annotations(
+                sandbox, [{"filename": entry["filename"], "quarantine": True}]
+            )
+
+            result = SimpleStep().run()
+
+            assert result["quarantined"] == 1
+            assert result["fatal_errors"] == 0
+            assert utils.load_references_json() == []
+
+            event = utils.load_history()[-1]
+            assert event["event"] == "quarantine"
+            # The full removed entry survives in the journal
+            assert {k: event[k] for k in entry} == entry
+            target = sandbox["quarantine"] / event["quarantine_filename"]
+            assert target.read_bytes() == content
+            quarantined_names.append(event["quarantine_filename"])
+
+        # Nothing was overwritten: seeded file intact, three distinct files
+        assert seeded.read_bytes() == b"seeded"
+        assert quarantined_names[0] == "Doe_Thing_2.pdf"
+        assert len({"Doe_Thing.pdf", *quarantined_names}) == 3
+        assert len(list(sandbox["quarantine"].iterdir())) == 3
+
+    def test_unlisted_file_is_quarantined_and_journalled_by_hash(self, sandbox):
+        """A file with no references.json entry is still moved (a routine
+        skip, as before), and journalled with what is known about it."""
+        path = sandbox["reference"] / "Stray.pdf"
+        path.write_bytes(b"stray")
+        utils.save_references_json([])
+        write_annotations(sandbox, [{"filename": "Stray.pdf", "quarantine": True}])
+
+        result = SimpleStep().run()
+
+        assert result["quarantine_errors"] == 1
+        assert result["fatal_errors"] == 0
+        assert (sandbox["quarantine"] / "Stray.pdf").exists()
+        [event] = utils.load_history()
+        assert event["event"] == "quarantine"
+        assert event["filename"] == "Stray.pdf"
+        assert event["quarantine_filename"] == "Stray.pdf"
+        assert event["file_hash"] == hashlib.sha256(b"stray").hexdigest()
+
+    def test_rename_event_holds_old_name_new_entry_and_previous(self, sandbox):
+        entry = seed_entry(
+            sandbox, "Doe_Old_Title.pdf", "Jane Doe", "Old Title", content=b"a"
+        )
+        entry["original_filename"] = "download.pdf"
+        entry["publisher"] = "Some Press"
+        utils.save_references_json([entry])
+        write_annotations(
+            sandbox,
+            [
+                {
+                    "filename": entry["filename"],
+                    "suggested_title": "New Title",
+                    "suggested_year": "n.d.",
+                }
+            ],
+        )
+
+        SimpleStep().run()
+
+        [stored] = utils.load_references_json()
+        [event] = utils.load_history()
+        assert event["event"] == "rename"
+        assert event["old_filename"] == "Doe_Old_Title.pdf"
+        # Recorded exactly as stored -- "n.d." is stored as ""
+        for key in ("filename", "author", "title", "year", "publisher"):
+            assert event[key] == stored[key]
+        assert event["year"] == ""
+        assert event["file_hash"] == entry["file_hash"]
+        assert event["original_filename"] == "download.pdf"
+        assert event["previous"] == {
+            "author": "Jane Doe",
+            "title": "Old Title",
+            "year": "2020",
+            "publisher": "Some Press",
+        }
+        assert (sandbox["reference"] / stored["filename"]).exists()
+
+    def test_history_failure_is_fatal_and_nothing_moves(self, sandbox, monkeypatch):
+        """No journal, no move: a file must never move without a durable
+        record of where it went."""
+        keep = seed_entry(sandbox, "Doe_Keep.pdf", "Jane Doe", "Keep", content=b"a")
+        drop = seed_entry(sandbox, "Roe_Drop.pdf", "Rick Roe", "Drop", content=b"b")
+        utils.save_references_json([keep, drop])
+        before = sandbox["references_json"].read_text()
+        write_annotations(
+            sandbox,
+            [
+                {"filename": drop["filename"], "quarantine": True},
+                {"filename": keep["filename"], "suggested_title": "New Title"},
+            ],
+        )
+
+        def boom(event, **fields):
+            raise OSError("simulated history failure")
+
+        monkeypatch.setattr("src.lib.steps.append_history", boom)
+
+        result = SimpleStep().run()
+
+        assert result["fatal_errors"] == 2
+        assert result["quarantined"] == 0
+        assert result["updated"] == 0
+        assert (sandbox["reference"] / "Doe_Keep.pdf").exists()
+        assert (sandbox["reference"] / "Roe_Drop.pdf").exists()
+        assert list(sandbox["quarantine"].iterdir()) == []
+        assert len(list(sandbox["reference"].iterdir())) == 2
+        assert sandbox["references_json"].read_text() == before
+
+    def test_interrupt_mid_run_saves_progress(self, sandbox, monkeypatch):
+        """Ctrl-C partway through used to leave moved/renamed files whose
+        entries still pointed at their old names (references.json was only
+        saved at the end). Now the finally saves what was done."""
+        gone = seed_entry(sandbox, "Poe_Gone.pdf", "Ann Poe", "Gone", content=b"q")
+        entries = [
+            seed_entry(sandbox, "Doe_One.pdf", "Jane Doe", "One", content=b"1"),
+            seed_entry(sandbox, "Roe_Two.pdf", "Rick Roe", "Two", content=b"2"),
+            seed_entry(sandbox, "Moe_Three.pdf", "Mo Moe", "Three", content=b"3"),
+        ]
+        utils.save_references_json([gone, *entries])
+        write_annotations(
+            sandbox,
+            [{"filename": gone["filename"], "quarantine": True}]
+            + [
+                {"filename": e["filename"], "suggested_title": f"New {e['title']}"}
+                for e in entries
+            ],
+        )
+
+        real_rename = utils.rename_file
+        calls = {"n": 0}
+
+        def rename_then_interrupt(old_path, new_path):
+            calls["n"] += 1
+            if calls["n"] == 2:
+                raise KeyboardInterrupt
+            return real_rename(old_path, new_path)
+
+        monkeypatch.setattr("src.lib.steps.rename_file", rename_then_interrupt)
+
+        with pytest.raises(KeyboardInterrupt):
+            SimpleStep().run()
+
+        # references.json on disk matches the files on disk
+        saved = utils.load_references_json()
+        assert "Poe_Gone.pdf" not in [e["filename"] for e in saved]
+        assert (sandbox["quarantine"] / "Poe_Gone.pdf").exists()
+        by_hash = {e["file_hash"]: e for e in saved}
+        first = by_hash[entries[0]["file_hash"]]
+        assert first["title"] == "New One"
+        assert first["filename"] != "Doe_One.pdf"
+        assert by_hash[entries[1]["file_hash"]]["filename"] == "Roe_Two.pdf"
+        assert by_hash[entries[2]["file_hash"]]["filename"] == "Moe_Three.pdf"
+        for e in saved:
+            assert (sandbox["reference"] / e["filename"]).exists()
+        assert "New One" in sandbox["references_md"].read_text()
+
+        log = (sandbox["markdown"] / SimpleStep.log_filename).read_text()
+        assert "interrupted" in log
+
+        history = utils.load_history()
+        renames = [h for h in history if h["event"] == "rename"]
+        assert [h["old_filename"] for h in renames] == ["Doe_One.pdf", "Roe_Two.pdf"]
+        failed = [h for h in history if h["event"] == "rename_failed"]
+        assert [h["old_filename"] for h in failed] == ["Roe_Two.pdf"]
+        assert failed[0]["error"] == "KeyboardInterrupt"
+
+    def test_failed_log_write_does_not_mask_interrupt(self, sandbox, monkeypatch):
+        """The log is written inside the finally; if that write fails it
+        must be recorded, not raised over the propagating interrupt."""
+        entry = seed_entry(sandbox, "Doe_Real.pdf", "Jane Doe", "Real", content=b"a")
+        utils.save_references_json([entry])
+        write_annotations(
+            sandbox, [{"filename": entry["filename"], "quarantine": True}]
+        )
+        monkeypatch.setattr(config, "MARKDOWN_DIR", sandbox["markdown"] / "missing")
+
+        def interrupt(src, dst):
+            raise KeyboardInterrupt
+
+        monkeypatch.setattr("src.lib.steps.shutil.move", interrupt)
+
+        step = SimpleStep()
+        with pytest.raises(KeyboardInterrupt):
+            step.run()
+        assert any(SimpleStep.log_filename in e.message for e in step.fatal_errors)
+        assert (sandbox["reference"] / "Doe_Real.pdf").exists()
+        failed = [h for h in utils.load_history() if h["event"] == "quarantine_failed"]
+        assert [h["filename"] for h in failed] == ["Doe_Real.pdf"]
+
+
 UPDATE_MODULES = [
     "src.scripts.updates.update_broken_titles",
     "src.scripts.updates.update_unknown_authors",
