@@ -771,6 +771,17 @@ class TestReferencesJsonOperations:
         assert json.loads(backup.read_text())[0]["filename"] == "first.pdf"
         assert json.loads(setup_json_env.read_text())[0]["filename"] == "second.pdf"
 
+    def test_save_references_json_without_backup(self, setup_json_env):
+        """backup=False leaves an existing .bak untouched."""
+        from src.lib.utils import save_references_json
+
+        save_references_json([{"filename": "first.pdf"}])
+        save_references_json([{"filename": "second.pdf"}])
+        save_references_json([{"filename": "third.pdf"}], backup=False)
+
+        backup = setup_json_env.with_name("references.json.bak")
+        assert json.loads(backup.read_text())[0]["filename"] == "first.pdf"
+
     def test_save_references_json_failure_leaves_original_intact(self, setup_json_env):
         """A save that fails mid-serialisation must leave references.json
         byte-identical, with no temp file behind and no .bak written."""
@@ -1281,9 +1292,9 @@ class TestHistoryJournal:
         events = load_history()
         assert [e["filename"] for e in events] == ["Doe_A.pdf"]
 
-    def test_malformed_middle_line_raises(self, history_file):
-        """Only the final line may be malformed; anything earlier is
-        corruption and must not be silently dropped."""
+    def test_malformed_middle_line_is_skipped_with_warning(self, history_file, capsys):
+        """A torn fragment ends up mid-file after the next append; the
+        journal must stay readable around it, with the skip reported."""
         from src.lib.utils import append_history, load_history
 
         append_history("ingest", filename="Doe_A.pdf")
@@ -1291,13 +1302,14 @@ class TestHistoryJournal:
             f.write("not json\n")
         append_history("ingest", filename="Roe_B.pdf")
 
-        with pytest.raises(ValueError, match="line 2"):
-            load_history()
+        events = load_history()
+        assert [e["filename"] for e in events] == ["Doe_A.pdf", "Roe_B.pdf"]
+        assert "line(s) 2 " in capsys.readouterr().err
 
     def test_append_after_torn_line_starts_fresh_line(self, history_file):
         """A new event must not be glued onto a torn fragment -- that would
         lose the new event as well."""
-        from src.lib.utils import append_history
+        from src.lib.utils import append_history, load_history
 
         append_history("ingest", filename="Doe_A.pdf")
         with open(history_file, "a", encoding="utf-8") as f:
@@ -1306,3 +1318,4 @@ class TestHistoryJournal:
 
         last = history_file.read_text(encoding="utf-8").splitlines()[-1]
         assert json.loads(last)["filename"] == "Roe_B.pdf"
+        assert [e["filename"] for e in load_history()] == ["Doe_A.pdf", "Roe_B.pdf"]

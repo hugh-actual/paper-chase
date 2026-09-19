@@ -785,3 +785,23 @@ class TestVerifyFilesAndMetadata:
 
         exit_code = main()
         assert exit_code == 1
+
+    def test_backup_holds_pre_run_state(self, sandbox):
+        """references.json is saved after every file, but only the first
+        save of a run backs up -- so .bak is the state before the batch,
+        not the state one file ago."""
+        existing = seed_entry(
+            sandbox, "Doe_Existing_Paper.pdf", "Jane Doe", "Existing Paper"
+        )
+        utils.save_references_json([existing])
+        pre_run = sandbox["references_json"].read_bytes()
+        for i in range(1, 4):
+            (sandbox["todo"] / f"file{i}.pdf").write_bytes(
+                make_pdf_bytes(f"Paper Number {i}", "Jane Smith", "2020")
+            )
+
+        DocumentProcessor().run()
+
+        assert len(utils.load_references_json()) == 4
+        backup = sandbox["references_json"].with_name("references.json.bak")
+        assert backup.read_bytes() == pre_run

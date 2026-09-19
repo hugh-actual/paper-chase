@@ -10,6 +10,7 @@ import re
 import json
 import os
 import shutil
+import sys
 from datetime import datetime, timezone
 from difflib import SequenceMatcher
 from pathlib import Path
@@ -237,17 +238,19 @@ def _atomic_write_text(path, text):
         raise
 
 
-def save_references_json(entries):
+def save_references_json(entries, backup: bool = True):
     """Save all references to JSON file, keeping the previous version.
 
     Serialised before anything on disk is touched, so an entry that can't
     be encoded fails with references.json (and its .bak) untouched. The
-    previous file is copied to references.json.bak, then replaced
-    atomically -- references.json is the only record of every file's
-    original name and hash, so it must never be left truncated.
+    previous file is copied to references.json.bak (unless `backup` is
+    False), then replaced atomically -- references.json is the only record
+    of every file's original name and hash, so it must never be left
+    truncated. Callers that save repeatedly during one run pass
+    backup=False after their first save, so .bak keeps the pre-run state.
     """
     text = json.dumps(entries, indent=2, ensure_ascii=False)
-    if config.REFERENCES_JSON.exists():
+    if backup and config.REFERENCES_JSON.exists():
         backup = config.REFERENCES_JSON.with_name(config.REFERENCES_JSON.name + ".bak")
         shutil.copy2(config.REFERENCES_JSON, backup)
     _atomic_write_text(config.REFERENCES_JSON, text)
@@ -290,28 +293,31 @@ def append_history(event, **fields):
 def load_history():
     """Load every event from the history journal, oldest first.
 
-    A malformed *final* line is an append interrupted mid-write and is
-    skipped. A malformed line anywhere else means the journal is corrupt
-    (or an earlier torn append was followed by later ones), so that raises
-    -- silently dropping a record from the middle would hide lost data.
+    Malformed lines are skipped with a warning on stderr naming them. A
+    torn append (power loss mid-write) leaves a fragment that the next
+    append_history() pushes mid-file, so refusing to load past one would
+    make the journal unreadable exactly when recovery needs it.
     Returns [] if the journal doesn't exist yet.
     """
     if not config.HISTORY_FILE.exists():
         return []
 
-    lines = config.HISTORY_FILE.read_text(encoding="utf-8").splitlines()
     events = []
-    for i, line in enumerate(lines):
+    bad_lines = []
+    lines = config.HISTORY_FILE.read_text(encoding="utf-8").splitlines()
+    for i, line in enumerate(lines, 1):
         if not line.strip():
             continue
         try:
             events.append(json.loads(line))
-        except json.JSONDecodeError as e:
-            if i == len(lines) - 1:
-                break
-            raise ValueError(
-                f"{config.HISTORY_FILE}: malformed history line {i + 1}: {e}"
-            ) from e
+        except json.JSONDecodeError:
+            bad_lines.append(i)
+    if bad_lines:
+        print(
+            f"Warning: skipped malformed line(s) {', '.join(map(str, bad_lines))} "
+            f"in {config.HISTORY_FILE}",
+            file=sys.stderr,
+        )
     return events
 
 

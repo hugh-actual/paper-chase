@@ -45,6 +45,9 @@ class DocumentProcessor:
         self.skipped_non_pdf = []
         self.conflicts = []  # Track files with hash/filename conflicts
         self.existing_references = None  # Pre-loaded references for conflict checking
+        # references.json is saved after every file; only the first save of
+        # the run backs up, so references.json.bak is the pre-run state.
+        self._backed_up = False
 
         # Single record of everything that went wrong, with the same
         # fatal/routine split as UpdateStep: a fatal error (an exception
@@ -303,7 +306,8 @@ class DocumentProcessor:
         """Save references.json, recording a failure as fatal rather than
         raising (so it can't mask an interrupt already propagating)."""
         try:
-            save_references_json(self.existing_references)
+            save_references_json(self.existing_references, backup=not self._backed_up)
+            self._backed_up = True
             return True
         except Exception as e:
             self._record_error(
@@ -413,12 +417,14 @@ class DocumentProcessor:
 
         # Written in the finally too, so a failure here is recorded rather
         # than raised -- raising would replace a propagating interrupt.
+        written = set()
         for write, name in (
             (self._write_conflict_report, "ingestion_conflicts.json"),
             (lambda: self._write_log(completed), "log.md"),
         ):
             try:
                 write()
+                written.add(name)
             except Exception as err:
                 print(f"  [!] Error writing {name}: {err}")
                 self._record_error(
@@ -430,9 +436,6 @@ class DocumentProcessor:
         print("=" * 70)
         print(f"Processed: {len(self.processed_files)} files")
         print(f"Conflicts: {len(self.conflicts)} files (kept in todo/)")
-        print(f"Skipped (large): {len(self.skipped_large)} files")
-        print(f"Skipped (non-PDF): {len(self.skipped_non_pdf)} files")
-        print(f"Issues: {len(self.log_entries)}")
         print(f"Failures: {len(self.fatal_errors)}")
         print(f"Skipped: {len(self.skipped_errors)}")
 
@@ -446,7 +449,8 @@ class DocumentProcessor:
             for err in self.skipped_errors:
                 print(f"  - {self._describe(err)}")
 
-        print(f"\n✓ Log saved to: {config.MARKDOWN_DIR / 'log.md'}")
+        if "log.md" in written:
+            print(f"\n✓ Log saved to: {config.MARKDOWN_DIR / 'log.md'}")
         # Last line on screen, deliberately: the detail above scrolls off, and
         # a partially-applied run must not end on an unqualified success.
         if not completed:
