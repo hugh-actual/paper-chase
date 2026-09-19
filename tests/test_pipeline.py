@@ -580,3 +580,145 @@ class TestDocumentProcessor:
         [event] = utils.load_history()
         assert event["event"] == "ingest"
         assert {k: event[k] for k in entry} == entry
+
+    def test_move_failure_is_fatal(self, sandbox, monkeypatch):
+        """A genuine failure ingesting a file (the move raising) is fatal,
+        unlike a conflict, and leaves the file in todo/ with its failure
+        journalled."""
+        utils.save_references_json([])
+        incoming = sandbox["todo"] / "download.pdf"
+        incoming.write_bytes(make_pdf_bytes("Great Findings", "Jane Smith", "2020"))
+
+        def boom(src, dst):
+            raise OSError("simulated move failure")
+
+        monkeypatch.setattr("src.scripts.core.process_documents.shutil.move", boom)
+
+        processor = DocumentProcessor()
+        result = processor.run()
+
+        assert result["fatal_errors"] == 1
+        assert result["processed"] == 0
+        assert incoming.exists()
+        [err] = processor.fatal_errors
+        assert err.phase == "ingest" and err.filename == "download.pdf"
+        assert [h["event"] for h in utils.load_history()] == ["ingest", "ingest_failed"]
+
+    def test_failed_md_regeneration_is_fatal(self, sandbox, monkeypatch):
+        """references.json is saved by the time references.md is
+        regenerated, so a failure there leaves the two out of sync -- and
+        `verify` never reads references.md, so nothing else catches it."""
+        utils.save_references_json([])
+        (sandbox["todo"] / "download.pdf").write_bytes(
+            make_pdf_bytes("Great Findings", "Jane Smith", "2020")
+        )
+
+        monkeypatch.setattr(
+            "src.scripts.core.process_documents.regenerate_references_md",
+            lambda: False,
+        )
+
+        result = DocumentProcessor().run()
+
+        assert result["processed"] == 1
+        assert result["fatal_errors"] == 1
+
+    def test_failed_json_save_is_fatal(self, sandbox, monkeypatch):
+        utils.save_references_json([])
+        (sandbox["todo"] / "download.pdf").write_bytes(
+            make_pdf_bytes("Great Findings", "Jane Smith", "2020")
+        )
+
+        def boom(entries):
+            raise OSError("simulated disk full")
+
+        monkeypatch.setattr(
+            "src.scripts.core.process_documents.save_references_json", boom
+        )
+
+        processor = DocumentProcessor()
+        result = processor.run()
+
+        assert result["fatal_errors"] >= 1
+        assert all(e.phase == "output" for e in processor.fatal_errors)
+
+    def test_conflicts_and_skips_are_routine(self, sandbox):
+        """Conflicts and large/non-PDF skips are expected outcomes: they are
+        listed under Skipped in the log, not Failures, and exit 0."""
+        existing = seed_entry(
+            sandbox, "Doe_Existing_Paper.pdf", "Jane Doe", "Existing Paper"
+        )
+        utils.save_references_json([existing])
+        (sandbox["todo"] / "dup.pdf").write_bytes(DUMMY_PDF)  # hash conflict
+        (sandbox["todo"] / "notes.txt").write_text("not a pdf")
+
+        processor = DocumentProcessor()
+        result = processor.run()
+
+        assert result["fatal_errors"] == 0
+        assert result["skipped"] == 2
+        log = (sandbox["markdown"] / "log.md").read_text()
+        assert "## Failures" not in log
+        skipped = log.split("## Skipped")[1]
+        assert "dup.pdf" in skipped and "notes.txt" in skipped
+
+    def test_log_separates_failures_from_skips(self, sandbox, monkeypatch):
+        utils.save_references_json([])
+        (sandbox["todo"] / "download.pdf").write_bytes(
+            make_pdf_bytes("Great Findings", "Jane Smith", "2020")
+        )
+        (sandbox["todo"] / "notes.txt").write_text("not a pdf")
+
+        def boom(src, dst):
+            raise OSError("simulated move failure")
+
+        monkeypatch.setattr("src.scripts.core.process_documents.shutil.move", boom)
+
+        DocumentProcessor().run()
+
+        log = (sandbox["markdown"] / "log.md").read_text()
+        failures = log.split("## Failures")[1].split("## Skipped")[0]
+        skipped = log.split("## Skipped")[1]
+        assert "simulated move failure" in failures
+        assert "notes.txt" not in failures
+        assert "notes.txt" in skipped
+        assert "simulated move failure" not in skipped
+
+    @pytest.mark.parametrize("fatal_count, expected_exit", [(0, 0), (1, 1), (3, 1)])
+    def test_main_returns_exit_code(
+        self, sandbox, monkeypatch, fatal_count, expected_exit
+    ):
+        """`make ingest` runs `verify` after `process`; a genuine ingest
+        failure must exit nonzero so the chain stops."""
+        module = importlib.import_module("src.scripts.core.process_documents")
+        monkeypatch.setattr(
+            DocumentProcessor,
+            "run",
+            lambda self: {
+                "processed": 0,
+                "conflicts": 0,
+                "skipped": 0,
+                "fatal_errors": fatal_count,
+            },
+        )
+
+        assert module.main() == expected_exit
+
+    def test_failed_log_write_does_not_mask_interrupt(self, sandbox, monkeypatch):
+        """The log is written inside the finally; if that write fails it
+        must be recorded, not raised over the propagating interrupt."""
+        utils.save_references_json([])
+        (sandbox["todo"] / "download.pdf").write_bytes(
+            make_pdf_bytes("Great Findings", "Jane Smith", "2020")
+        )
+        monkeypatch.setattr(config, "MARKDOWN_DIR", sandbox["markdown"] / "missing")
+
+        def interrupt(src, dst):
+            raise KeyboardInterrupt
+
+        monkeypatch.setattr("src.scripts.core.process_documents.shutil.move", interrupt)
+
+        processor = DocumentProcessor()
+        with pytest.raises(KeyboardInterrupt):
+            processor.run()
+        assert any("log.md" in e.message for e in processor.fatal_errors)

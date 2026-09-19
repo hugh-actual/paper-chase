@@ -16,6 +16,7 @@ from pypdf import PdfReader
 # Configuration is accessed as config.<NAME> so tests can redirect
 # paths by patching src.lib.config alone
 from src.lib import config
+from src.lib.steps import StepError
 
 # Import shared utilities
 from src.lib.utils import (
@@ -42,9 +43,42 @@ class DocumentProcessor:
         self.log_entries = []
         self.skipped_large = []
         self.skipped_non_pdf = []
-        self.errors = []
         self.conflicts = []  # Track files with hash/filename conflicts
         self.existing_references = None  # Pre-loaded references for conflict checking
+
+        # Single record of everything that went wrong, with the same
+        # fatal/routine split as UpdateStep: a fatal error (an exception
+        # while ingesting a file, references.json or references.md failing
+        # to write) makes the script exit nonzero; conflicts and skipped
+        # large/non-PDF files are routine and don't.
+        self.errors: list[StepError] = []
+
+    def _record_error(
+        self, phase: str, filename: str, message: str, fatal: bool = False
+    ) -> None:
+        """Record a failure or a skip. See StepError for the distinction."""
+        self.errors.append(StepError(phase, filename, message, fatal))
+
+    @property
+    def fatal_errors(self) -> list[StepError]:
+        return [e for e in self.errors if e.fatal]
+
+    @property
+    def skipped_errors(self) -> list[StepError]:
+        return [e for e in self.errors if not e.fatal]
+
+    @classmethod
+    def run_as_main(cls) -> int:
+        """Entry point for `python -m`: nonzero only on genuine failures,
+        so `make ingest` stops before `verify` prints a misleading
+        all-clear. Conflicts and skipped files still exit 0."""
+        return 1 if cls().run()["fatal_errors"] else 0
+
+    @staticmethod
+    def _describe(err: StepError) -> str:
+        """One-line rendering of an error, including which phase it came from."""
+        where = f"{err.phase}/{err.filename}" if err.filename else err.phase
+        return f"[{where}] {err.message}"
 
     def extract_pdf_metadata(self, pdf_path: Path) -> Dict[str, str]:
         """Extract metadata from PDF file."""
@@ -194,8 +228,8 @@ class DocumentProcessor:
                         "conflicts": conflicts_found,
                     }
                 )
-                self.log_entries.append(
-                    f"CONFLICT: {file_path.name} - {conflicts_found[0]['message']}"
+                self._record_error(
+                    "conflict", file_path.name, conflicts_found[0]["message"]
                 )
                 return False  # Skip this file
 
@@ -254,18 +288,31 @@ class DocumentProcessor:
                 }
             )
 
-            # Save after every file, not once at the end: an interrupted
-            # batch must not leave moved files with no references.json entry.
-            save_references_json(self.existing_references)
-
-            return True
-
         except Exception as e:
-            self.errors.append(f"Error processing {file_path.name}: {str(e)}")
+            self._record_error("ingest", file_path.name, str(e), fatal=True)
             return False
 
-    def run(self):
-        """Main processing loop."""
+        # Save after every file, not once at the end: an interrupted batch
+        # must not leave moved files with no references.json entry. The file
+        # *is* ingested either way (moved, journalled, in memory for the
+        # final save), so a failure here is recorded but still returns True.
+        self._save_references(file_path.name)
+        return True
+
+    def _save_references(self, filename: str = "") -> bool:
+        """Save references.json, recording a failure as fatal rather than
+        raising (so it can't mask an interrupt already propagating)."""
+        try:
+            save_references_json(self.existing_references)
+            return True
+        except Exception as e:
+            self._record_error(
+                "output", filename, f"Failed to save references.json: {e}", fatal=True
+            )
+            return False
+
+    def run(self) -> dict:
+        """Main processing loop. Returns a summary dict with counts."""
         print("Starting document processing...")
 
         # Pre-load existing references for conflict checking
@@ -295,6 +342,9 @@ class DocumentProcessor:
             if size >= MAX_FILE_SIZE:
                 large_pdfs.append(pdf)
                 self.skipped_large.append(f"{pdf.name} ({size / 1024 / 1024:.1f}MB)")
+                self._record_error(
+                    "skip", pdf.name, f"Large PDF ({size / 1024 / 1024:.1f}MB, ≥50MB)"
+                )
             else:
                 small_pdfs.append(pdf)
 
@@ -305,6 +355,7 @@ class DocumentProcessor:
         # Record non-PDF files
         for f in non_pdf_files:
             self.skipped_non_pdf.append(f.name)
+            self._record_error("skip", f.name, "Not a PDF")
 
         # Process small PDFs. Each file saves references.json as it goes;
         # the finally makes sure an interrupted batch (Ctrl-C is a
@@ -323,6 +374,13 @@ class DocumentProcessor:
         finally:
             self._finish(completed)
 
+        return {
+            "processed": len(self.processed_files),
+            "conflicts": len(self.conflicts),
+            "skipped": len(self.skipped_errors),
+            "fatal_errors": len(self.fatal_errors),
+        }
+
     def _finish(self, completed: bool) -> None:
         """Save, regenerate, and log -- on success and on interruption alike."""
         if not completed:
@@ -334,19 +392,76 @@ class DocumentProcessor:
         # Final save, then generate references.md from it
         if self.processed_files:
             print("Saving references.json...")
-            try:
-                save_references_json(self.existing_references)
-            except Exception as e:
-                # Don't let a failed save mask the interrupt (if any) that
-                # got us here; the per-file saves already persisted most of it.
-                self.errors.append(f"Error saving references.json: {e}")
+            self._save_references()
             print("Generating references.md from JSON...")
-            if regenerate_references_md():
+            try:
+                regenerated = regenerate_references_md()
+            except Exception as e:
+                # Recorded, not raised: it must not mask a propagating interrupt
+                print(f"  [!] Error: {e}")
+                regenerated = False
+            if regenerated:
                 print("  ✓ References.md generated successfully")
             else:
                 print("  ⚠ Warning: generate_references_md.py failed")
+                # references.json now lists files references.md doesn't, and
+                # `verify` never reads references.md -- nothing downstream
+                # would catch this.
+                self._record_error(
+                    "output", "", "Failed to regenerate references.md", fatal=True
+                )
 
-        # Write log
+        # Written in the finally too, so a failure here is recorded rather
+        # than raised -- raising would replace a propagating interrupt.
+        for write, name in (
+            (self._write_conflict_report, "ingestion_conflicts.json"),
+            (lambda: self._write_log(completed), "log.md"),
+        ):
+            try:
+                write()
+            except Exception as err:
+                print(f"  [!] Error writing {name}: {err}")
+                self._record_error(
+                    "output", "", f"Failed to write {name}: {err}", fatal=True
+                )
+
+        print("\n" + "=" * 70)
+        print("SUMMARY")
+        print("=" * 70)
+        print(f"Processed: {len(self.processed_files)} files")
+        print(f"Conflicts: {len(self.conflicts)} files (kept in todo/)")
+        print(f"Skipped (large): {len(self.skipped_large)} files")
+        print(f"Skipped (non-PDF): {len(self.skipped_non_pdf)} files")
+        print(f"Issues: {len(self.log_entries)}")
+        print(f"Failures: {len(self.fatal_errors)}")
+        print(f"Skipped: {len(self.skipped_errors)}")
+
+        if self.fatal_errors:
+            print("\nFailures:")
+            for err in self.fatal_errors:
+                print(f"  - {self._describe(err)}")
+
+        if self.skipped_errors:
+            print("\nSkipped (left in todo/):")
+            for err in self.skipped_errors:
+                print(f"  - {self._describe(err)}")
+
+        print(f"\n✓ Log saved to: {config.MARKDOWN_DIR / 'log.md'}")
+        # Last line on screen, deliberately: the detail above scrolls off, and
+        # a partially-applied run must not end on an unqualified success.
+        if not completed:
+            print("✗ Interrupted -- progress so far is saved; rerun to continue.")
+        elif self.fatal_errors:
+            print(
+                f"✗ {len(self.fatal_errors)} genuine failure(s) "
+                "-- this run did not fully apply."
+            )
+        else:
+            print("✓ Completed with no failures.")
+        print("=" * 70)
+
+    def _write_log(self, completed: bool) -> None:
+        """Write log.md."""
         print("Writing log...")
         with open(config.MARKDOWN_DIR / "log.md", "w", encoding="utf-8") as f:
             f.write("# Document Processing Log\n\n")
@@ -362,13 +477,27 @@ class DocumentProcessor:
             )
             f.write(f"- **Large PDFs skipped (≥50MB)**: {len(self.skipped_large)}\n")
             f.write(f"- **Non-PDF files skipped**: {len(self.skipped_non_pdf)}\n")
-            f.write(f"- **Errors encountered**: {len(self.errors)}\n")
+            f.write(f"- **Failures**: {len(self.fatal_errors)}\n")
+            f.write(f"- **Skipped**: {len(self.skipped_errors)}\n")
             f.write(f"- **Issues logged**: {len(self.log_entries)}\n\n")
 
             if self.processed_files:
                 f.write("## Ingested Files\n\n")
                 for p in self.processed_files:
                     f.write(f"- {p['original_filename']} → {p['new_filename']}\n")
+                f.write("\n")
+
+            if self.fatal_errors:
+                f.write("## Failures\n\n")
+                for err in self.fatal_errors:
+                    f.write(f"- {self._describe(err)}\n")
+                f.write("\n")
+
+            if self.skipped_errors:
+                f.write("## Skipped\n\n")
+                f.write("Left in todo/ -- conflicts, large and non-PDF files.\n\n")
+                for err in self.skipped_errors:
+                    f.write(f"- {self._describe(err)}\n")
                 f.write("\n")
 
             if self.conflicts:
@@ -382,31 +511,14 @@ class DocumentProcessor:
                             f.write(f"  - Existing title: {c['existing_title']}\n")
                     f.write("\n")
 
-            if self.skipped_large:
-                f.write("## Large Files Skipped (≥50MB)\n\n")
-                for item in self.skipped_large:
-                    f.write(f"- {item}\n")
-                f.write("\n")
-
-            if self.skipped_non_pdf:
-                f.write("## Non-PDF Files Skipped\n\n")
-                for item in self.skipped_non_pdf:
-                    f.write(f"- {item}\n")
-                f.write("\n")
-
-            if self.errors:
-                f.write("## Errors\n\n")
-                for error in self.errors:
-                    f.write(f"- {error}\n")
-                f.write("\n")
-
             if self.log_entries:
                 f.write("## Issues and Warnings\n\n")
                 for entry in self.log_entries:
                     f.write(f"- {entry}\n")
                 f.write("\n")
 
-        # Write JSON conflict report if there are conflicts
+    def _write_conflict_report(self) -> None:
+        """Write json-output/ingestion_conflicts.json if there are conflicts."""
         if self.conflicts:
             conflict_report = {
                 "generated": datetime.now().isoformat(),
@@ -417,18 +529,11 @@ class DocumentProcessor:
                 json.dump(conflict_report, f, indent=2, ensure_ascii=False)
             print(f"  Conflict report written to: {conflict_file}")
 
-        if completed:
-            print("\n✓ Processing complete!")
-        else:
-            print("\n✗ Processing interrupted -- progress so far is saved.")
-        print(f"  - Processed: {len(self.processed_files)} files")
-        print(f"  - Conflicts: {len(self.conflicts)} files (kept in todo/)")
-        print(f"  - Skipped (large): {len(self.skipped_large)} files")
-        print(f"  - Skipped (non-PDF): {len(self.skipped_non_pdf)} files")
-        print(f"  - Errors: {len(self.errors)}")
-        print(f"  - Issues: {len(self.log_entries)}")
+
+def main():
+    """Main entry point."""
+    return DocumentProcessor.run_as_main()
 
 
 if __name__ == "__main__":
-    processor = DocumentProcessor()
-    processor.run()
+    exit(main())
