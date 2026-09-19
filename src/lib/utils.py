@@ -848,6 +848,43 @@ def is_unknown_author(author: str) -> bool:
     return author_lower in ["unknown", "---", "null", ""]
 
 
+_JUNK_TITLE_PREFIX_RE = re.compile(r"^Microsoft\s+\S+\s*-\s*", re.IGNORECASE)
+_JUNK_TITLE_SUFFIX_RE = re.compile(r"\.(docx|doc|tex|dvi|pdf|ps)$", re.IGNORECASE)
+_JUNK_TITLE_VALUES = {"untitled", "untitled document"}
+_JUNK_AUTHOR_VALUES = {"administrator", "admin", "user", "owner", "unknown", "author"}
+
+
+def is_junk_metadata(field: str, value: Optional[str]) -> bool:
+    """Check whether an embedded-PDF metadata value is generic junk that
+    should never outrank a well-formed filename or be treated as real
+    metadata (e.g. `/Title` "Microsoft Word - draft3.doc", `/Author`
+    "Administrator" left by a scanner or an unsaved default).
+
+    Deliberately generic only -- collection-specific junk patterns (real
+    titles, filenames) belong in the untracked local-patterns file, not
+    here.
+
+    Args:
+        field: "title" or "author".
+        value: The metadata value to check.
+    """
+    if not value or not str(value).strip():
+        return True
+    v = str(value).strip()
+
+    if field == "title":
+        if _JUNK_TITLE_PREFIX_RE.match(v):
+            return True
+        if _JUNK_TITLE_SUFFIX_RE.search(v):
+            return True
+        return v.lower() in _JUNK_TITLE_VALUES
+
+    if field == "author":
+        return v.lower() in _JUNK_AUTHOR_VALUES
+
+    return False
+
+
 def is_suspect_filename(filename: str) -> bool:
     """Check if a filename appears to have bad metadata."""
     # Remove .pdf extension

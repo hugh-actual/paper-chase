@@ -30,6 +30,7 @@ from src.lib.utils import (
     check_hash_conflict,
     _atomic_write_text,
     normalize_text,
+    is_junk_metadata,
 )
 
 # Configuration
@@ -52,6 +53,42 @@ def _extract_plausible_year(text: str) -> Optional[str]:
         if 1500 <= year <= current_year + 1:
             return match.group(1)
     return None
+
+
+def choose_metadata(
+    pdf_meta: Dict[str, object], filename_info: Dict[str, object]
+) -> Dict[str, object]:
+    """Decide final author/title/year/publisher from embedded PDF metadata
+    and filename-pattern parsing.
+
+    A structured filename (one that matched a recognised author/title
+    pattern in `extract_from_filename`) is trusted field-by-field over
+    embedded PDF metadata, which is often generic scanner/software junk
+    (`/Title` "Microsoft Word - draft3.doc", `/Author` "Administrator")
+    -- metadata only fills a field the filename left blank. An
+    unstructured filename (arxiv-number or bare-name fallback) instead
+    lets non-junk metadata win, falling back to the filename otherwise.
+
+    `year` and `publisher` are never sourced from PDF metadata (see
+    `extract_pdf_metadata`): year comes from the filename or "n.d.";
+    publisher is left empty.
+    """
+    structured = bool(filename_info.get("structured"))
+
+    def pick(field):
+        meta_value = pdf_meta.get(field)
+        file_value = filename_info.get(field)
+        meta_ok = bool(meta_value) and not is_junk_metadata(field, meta_value)
+        if structured:
+            return file_value if file_value else (meta_value if meta_ok else None)
+        return meta_value if meta_ok else file_value
+
+    return {
+        "author": pick("author"),
+        "title": pick("title"),
+        "year": filename_info.get("year") or "n.d.",
+        "publisher": pdf_meta.get("publisher"),
+    }
 
 
 class DocumentProcessor:
@@ -102,7 +139,15 @@ class DocumentProcessor:
         return f"[{where}] {err.message}"
 
     def extract_pdf_metadata(self, pdf_path: Path) -> Dict[str, str]:
-        """Extract metadata from PDF file."""
+        """Extract metadata from PDF file.
+
+        `year` and `publisher` are never populated from embedded PDF
+        metadata: `/CreationDate`/`/ModDate` record when a file was
+        scanned or saved, not when the work was published, and
+        `/Producer` names the PDF-generating software, not a publisher.
+        Both fields are sourced from the filename instead (see
+        `choose_metadata`).
+        """
         metadata = {"title": None, "author": None, "year": None, "publisher": None}
 
         try:
@@ -113,19 +158,12 @@ class DocumentProcessor:
                 if info:
                     title = info.get("/Title", None)
                     author = info.get("/Author", None)
-                    metadata["title"] = normalize_text(str(title)) if title else None
-                    metadata["author"] = normalize_text(str(author)) if author else None
-
-                    # Try to extract year from creation or modification date
-                    for date_key in ["/CreationDate", "/ModDate"]:
-                        if date_key in info and info[date_key]:
-                            date_str = str(info[date_key])
-                            year_match = re.search(r"(\d{4})", date_str)
-                            if year_match:
-                                metadata["year"] = year_match.group(1)
-                                break
-
-                    metadata["publisher"] = info.get("/Producer", None)
+                    metadata["title"] = (
+                        normalize_text(str(title).strip()) if title else None
+                    )
+                    metadata["author"] = (
+                        normalize_text(str(author).strip()) if author else None
+                    )
         except Exception as e:
             self.log_entries.append(
                 f"Error extracting metadata from {pdf_path.name}: {str(e)}"
@@ -133,9 +171,17 @@ class DocumentProcessor:
 
         return metadata
 
-    def extract_from_filename(self, filename: str) -> Dict[str, str]:
-        """Extract author, title, and year from filename patterns."""
-        info = {"author": None, "title": None, "year": None}
+    def extract_from_filename(self, filename: str) -> Dict[str, object]:
+        """Extract author, title, and year from filename patterns.
+
+        `structured` reports whether the filename matched a recognised
+        author/title(/year) pattern rather than falling back to the
+        arxiv-number or default (whole-name-as-title) parse. It's how
+        `choose_metadata` decides whether a curated filename should
+        outrank embedded PDF metadata field-by-field, or only fill gaps
+        that (non-junk) metadata leaves.
+        """
+        info = {"author": None, "title": None, "year": None, "structured": False}
 
         # Remove extension
         name = filename.rsplit(".", 1)[0]
@@ -145,6 +191,7 @@ class DocumentProcessor:
         if match:
             info["author"] = normalize_text(match.group(1).strip())
             info["title"] = normalize_text(match.group(2).strip())
+            info["structured"] = True
             return info
 
         # Pattern 2: YYYY-Author-Title. The author segment must contain at
@@ -156,6 +203,7 @@ class DocumentProcessor:
             info["year"] = match.group(1)
             info["author"] = normalize_text(match.group(2).strip())
             info["title"] = normalize_text(match.group(3).strip())
+            info["structured"] = True
             return info
 
         # Pattern 3: YYYY_Book_Title or similar
@@ -163,6 +211,7 @@ class DocumentProcessor:
         if match:
             info["year"] = match.group(1)
             info["title"] = normalize_text(match.group(2).strip())
+            info["structured"] = True
             return info
 
         # Pattern 4: Author et al - Title
@@ -170,9 +219,11 @@ class DocumentProcessor:
         if match:
             info["author"] = normalize_text(match.group(1).strip())
             info["title"] = normalize_text(match.group(2).strip())
+            info["structured"] = True
             return info
 
-        # Pattern 5: arxiv number + title
+        # Pattern 5: arxiv number + title (not "structured": there's no
+        # author or year here, just a title, same as the default branch)
         match = re.match(r"(\d{4}\.\d+)\s*(.+)?", name)
         if match:
             title = match.group(2).strip() if match.group(2) else match.group(1)
@@ -192,13 +243,12 @@ class DocumentProcessor:
             metadata = self.extract_pdf_metadata(file_path)
             filename_info = self.extract_from_filename(file_path.name)
 
-            # Merge information (prefer metadata, fallback to filename)
-            author = metadata.get("author") or filename_info.get("author")
-            title = (
-                metadata.get("title") or filename_info.get("title") or file_path.stem
-            )
-            year = metadata.get("year") or filename_info.get("year") or "n.d."
-            publisher = metadata.get("publisher")
+            # Merge information (see choose_metadata for the precedence rules)
+            chosen = choose_metadata(metadata, filename_info)
+            author = chosen["author"]
+            title = chosen["title"] or file_path.stem
+            year = chosen["year"]
+            publisher = chosen["publisher"]
 
             # Create reference stub with hash and filename before processing.
             # Reserve names against both this batch's processed files and

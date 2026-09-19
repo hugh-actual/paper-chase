@@ -17,7 +17,7 @@ from pypdf import PdfWriter
 import src.lib.config as config
 import src.lib.utils as utils
 from src.lib.steps import UpdateStep
-from src.scripts.core.process_documents import DocumentProcessor
+from src.scripts.core.process_documents import DocumentProcessor, choose_metadata
 
 DUMMY_PDF = b"%PDF-1.4 dummy content for hashing\n%%EOF\n"
 
@@ -389,6 +389,104 @@ class TestExtractFromFilename:
         assert info["title"] == "Über formal unentscheidbare Sätze"
         assert unicodedata.is_normalized("NFC", info["author"])
         assert unicodedata.is_normalized("NFC", info["title"])
+
+
+class TestChooseMetadata:
+    """Unit tests for choose_metadata()'s precedence rules (plan task T7)."""
+
+    def test_structured_filename_wins_over_junk_metadata(self):
+        pdf_meta = {
+            "title": "Microsoft Word - draft3.doc",
+            "author": "Administrator",
+            "year": None,
+            "publisher": None,
+        }
+        filename_info = {
+            "author": "Knuth",
+            "title": "Art of Computer Programming",
+            "year": "1975",
+            "structured": True,
+        }
+        chosen = choose_metadata(pdf_meta, filename_info)
+        assert chosen["author"] == "Knuth"
+        assert chosen["title"] == "Art of Computer Programming"
+        assert chosen["year"] == "1975"
+        assert chosen["publisher"] is None
+
+    def test_structured_filename_gap_filled_by_non_junk_metadata(self):
+        """A structured pattern that doesn't produce an author (e.g.
+        YYYY_Book_Title) still gets one from non-junk metadata."""
+        pdf_meta = {
+            "title": "irrelevant",
+            "author": "Jane Doe",
+            "year": None,
+            "publisher": None,
+        }
+        filename_info = {
+            "author": None,
+            "title": "Deep Learning",
+            "year": "2015",
+            "structured": True,
+        }
+        chosen = choose_metadata(pdf_meta, filename_info)
+        assert chosen["author"] == "Jane Doe"
+        assert chosen["title"] == "Deep Learning"
+
+    def test_unstructured_filename_non_junk_metadata_wins(self):
+        pdf_meta = {
+            "title": "Great Findings",
+            "author": "Jane Smith",
+            "year": None,
+            "publisher": None,
+        }
+        filename_info = {
+            "author": None,
+            "title": "download",
+            "year": None,
+            "structured": False,
+        }
+        chosen = choose_metadata(pdf_meta, filename_info)
+        assert chosen["author"] == "Jane Smith"
+        assert chosen["title"] == "Great Findings"
+
+    def test_unstructured_filename_junk_metadata_falls_back_to_filename(self):
+        pdf_meta = {
+            "title": "Microsoft Word - x.doc",
+            "author": "Administrator",
+            "year": None,
+            "publisher": None,
+        }
+        filename_info = {
+            "author": None,
+            "title": "download",
+            "year": None,
+            "structured": False,
+        }
+        chosen = choose_metadata(pdf_meta, filename_info)
+        assert chosen["title"] == "download"
+        assert chosen["author"] is None
+
+    def test_year_never_from_pdf_metadata(self):
+        """Even if pdf_meta somehow carried a year, choose_metadata must
+        never use it -- only the filename or 'n.d.'"""
+        pdf_meta = {"title": None, "author": None, "year": "2021", "publisher": None}
+        filename_info = {
+            "author": None,
+            "title": "x",
+            "year": None,
+            "structured": True,
+        }
+        chosen = choose_metadata(pdf_meta, filename_info)
+        assert chosen["year"] == "n.d."
+
+    def test_publisher_passthrough(self):
+        """publisher always comes straight from pdf_meta (never the
+        filename); extract_pdf_metadata itself always hands back None."""
+        chosen = choose_metadata(
+            {"title": None, "author": None, "year": None, "publisher": None},
+            {"author": None, "title": "x", "year": None, "structured": False},
+        )
+        assert chosen["publisher"] is None
 
 
 class TestDocumentProcessor:
@@ -791,6 +889,87 @@ class TestDocumentProcessor:
         with pytest.raises(KeyboardInterrupt):
             processor.run()
         assert any("log.md" in e.message for e in processor.fatal_errors)
+
+    def test_metadata_precedence_structured_filename_wins_over_junk_metadata(
+        self, sandbox
+    ):
+        """Plan T7 scenario (a): a curated, structured filename beats junk
+        embedded metadata (a Microsoft Word placeholder title, an
+        "Administrator" author, and a CreationDate that must not leak into
+        the year)."""
+        utils.save_references_json([])
+        content = make_pdf_bytes(
+            "Microsoft Word - draft3.doc", "Administrator", year="2019"
+        )
+        incoming = sandbox["todo"] / "1975-Knuth-Art of Computer Programming.pdf"
+        incoming.write_bytes(content)
+
+        processor = DocumentProcessor()
+        processor.run()
+
+        entries = utils.load_references_json()
+        assert len(entries) == 1
+        entry = entries[0]
+        assert entry["author"] == "Knuth"
+        assert entry["title"] == "Art of Computer Programming"
+        assert entry["year"] == "1975"
+        assert entry["publisher"] == ""
+
+    def test_metadata_precedence_unstructured_filename_uses_good_metadata(
+        self, sandbox
+    ):
+        """Plan T7 scenario (b): an unstructured filename with good
+        embedded metadata still uses that metadata -- existing tests
+        (e.g. test_orphaned_reference_entry_reserves_filename) already
+        depend on this precedence via similar "download.pdf" fixtures."""
+        utils.save_references_json([])
+        content = make_pdf_bytes("Great Findings", "Jane Smith", year="2020")
+        incoming = sandbox["todo"] / "download.pdf"
+        incoming.write_bytes(content)
+
+        processor = DocumentProcessor()
+        processor.run()
+
+        entries = utils.load_references_json()
+        assert len(entries) == 1
+        entry = entries[0]
+        assert entry["author"] == "Jane Smith"
+        assert entry["title"] == "Great Findings"
+
+    def test_metadata_precedence_creation_date_never_used_for_year(self, sandbox):
+        """Plan T7 scenario (c): the bracket pattern is structured but
+        never carries a year; the PDF's CreationDate must not fill it in
+        either -- the entry's year stays empty ("n.d." downstream)."""
+        utils.save_references_json([])
+        content = make_pdf_bytes("irrelevant", "irrelevant", year="2021")
+        incoming = sandbox["todo"] / "[Hastie]Elements of Statistical Learning.pdf"
+        incoming.write_bytes(content)
+
+        processor = DocumentProcessor()
+        processor.run()
+
+        entries = utils.load_references_json()
+        assert len(entries) == 1
+        assert entries[0]["year"] == ""
+
+    def test_metadata_precedence_unstructured_junk_metadata_uses_filename_stem(
+        self, sandbox
+    ):
+        """Plan T7 scenario (d): an unstructured filename with junk
+        embedded title metadata falls back to the filename stem."""
+        utils.save_references_json([])
+        content = make_pdf_bytes(
+            "Microsoft Word - draft.doc", "Administrator", year="2020"
+        )
+        incoming = sandbox["todo"] / "somefile.pdf"
+        incoming.write_bytes(content)
+
+        processor = DocumentProcessor()
+        processor.run()
+
+        entries = utils.load_references_json()
+        assert len(entries) == 1
+        assert entries[0]["title"] == "somefile"
 
 
 class TestVerifyFilesAndMetadata:

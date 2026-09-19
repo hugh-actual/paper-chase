@@ -24,6 +24,7 @@ from src.lib.utils import (  # noqa: E402
     normalize_text,
     calculate_file_hash,
     is_unknown_author,
+    is_junk_metadata,
     is_suspect_filename,
     check_hash_conflict,
     check_filename_conflict,
@@ -706,6 +707,58 @@ class TestIsUnknownAuthor:
         """Valid author name returns False."""
         assert is_unknown_author("John Smith") is False
         assert is_unknown_author("Hastie") is False
+
+
+# =============================================================================
+# Tests for is_junk_metadata()
+# =============================================================================
+
+
+class TestIsJunkMetadata:
+    """Tests for is_junk_metadata() function."""
+
+    def test_blank_title_is_junk(self):
+        assert is_junk_metadata("title", "") is True
+        assert is_junk_metadata("title", "   ") is True
+        assert is_junk_metadata("title", None) is True
+
+    def test_microsoft_word_prefix_is_junk(self):
+        assert is_junk_metadata("title", "Microsoft Word - draft3.doc") is True
+
+    def test_microsoft_powerpoint_prefix_is_junk(self):
+        assert is_junk_metadata("title", "Microsoft PowerPoint - slides.pptx") is True
+
+    def test_microsoft_prefix_case_insensitive(self):
+        assert is_junk_metadata("title", "microsoft word - notes.doc") is True
+
+    def test_title_ending_in_software_extension_is_junk(self):
+        for ext in ("doc", "docx", "tex", "dvi", "pdf", "ps"):
+            assert is_junk_metadata("title", f"some_file.{ext}") is True
+
+    def test_untitled_is_junk(self):
+        assert is_junk_metadata("title", "Untitled") is True
+        assert is_junk_metadata("title", "untitled document") is True
+
+    def test_real_title_is_not_junk(self):
+        assert is_junk_metadata("title", "Elements of Statistical Learning") is False
+
+    def test_blank_author_is_junk(self):
+        assert is_junk_metadata("author", "") is True
+        assert is_junk_metadata("author", None) is True
+
+    def test_generic_author_values_are_junk(self):
+        for value in (
+            "Administrator",
+            "admin",
+            "User",
+            "OWNER",
+            "unknown",
+            "Author",
+        ):
+            assert is_junk_metadata("author", value) is True
+
+    def test_real_author_is_not_junk(self):
+        assert is_junk_metadata("author", "Jane Doe") is False
 
 
 # =============================================================================
