@@ -8,6 +8,7 @@ managing references.md, and file operations.
 import hashlib
 import re
 import json
+import os
 import shutil
 from difflib import SequenceMatcher
 from pathlib import Path
@@ -214,10 +215,41 @@ def load_references_json():
         return json.load(f)
 
 
+def _atomic_write_text(path, text):
+    """Replace `path` with `text` so a crash never leaves it truncated.
+
+    The text goes to a sibling temp file first (same directory, so the final
+    os.replace is an atomic rename on one filesystem), is fsynced, and only
+    then swapped in. Readers see either the old file or the new one, never
+    a half-written mix.
+    """
+    path = Path(path)
+    tmp_path = path.with_name(path.name + ".tmp")
+    try:
+        with open(tmp_path, "w", encoding="utf-8") as f:
+            f.write(text)
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(tmp_path, path)
+    except BaseException:
+        tmp_path.unlink(missing_ok=True)
+        raise
+
+
 def save_references_json(entries):
-    """Save all references to JSON file."""
-    with open(config.REFERENCES_JSON, "w", encoding="utf-8") as f:
-        json.dump(entries, f, indent=2, ensure_ascii=False)
+    """Save all references to JSON file, keeping the previous version.
+
+    Serialised before anything on disk is touched, so an entry that can't
+    be encoded fails with references.json (and its .bak) untouched. The
+    previous file is copied to references.json.bak, then replaced
+    atomically -- references.json is the only record of every file's
+    original name and hash, so it must never be left truncated.
+    """
+    text = json.dumps(entries, indent=2, ensure_ascii=False)
+    if config.REFERENCES_JSON.exists():
+        backup = config.REFERENCES_JSON.with_name(config.REFERENCES_JSON.name + ".bak")
+        shutil.copy2(config.REFERENCES_JSON, backup)
+    _atomic_write_text(config.REFERENCES_JSON, text)
 
 
 def build_reference_entry(

@@ -760,6 +760,53 @@ class TestReferencesJsonOperations:
         assert len(content) == 1
         assert content[0]["filename"] == "test.pdf"
 
+    def test_save_references_json_keeps_backup(self, setup_json_env):
+        """Each save copies the previous file to references.json.bak."""
+        from src.lib.utils import save_references_json
+
+        save_references_json([{"filename": "first.pdf"}])
+        save_references_json([{"filename": "second.pdf"}])
+
+        backup = setup_json_env.with_name("references.json.bak")
+        assert json.loads(backup.read_text())[0]["filename"] == "first.pdf"
+        assert json.loads(setup_json_env.read_text())[0]["filename"] == "second.pdf"
+
+    def test_save_references_json_failure_leaves_original_intact(self, setup_json_env):
+        """A save that fails mid-serialisation must leave references.json
+        byte-identical, with no temp file behind and no .bak written."""
+        from src.lib.utils import save_references_json
+
+        save_references_json([{"filename": "keep.pdf"}])
+        before = setup_json_env.read_bytes()
+        setup_json_env.with_name("references.json.bak").unlink()
+
+        with pytest.raises(TypeError):
+            save_references_json([{"filename": "bad.pdf", "oops": object()}])
+
+        assert setup_json_env.read_bytes() == before
+        assert sorted(p.name for p in setup_json_env.parent.iterdir()) == [
+            "references.json"
+        ]
+
+    def test_atomic_write_failure_removes_temp_file(self, tmp_path, monkeypatch):
+        """If the write itself fails after the temp file exists, the temp
+        file is cleaned up and the target is untouched."""
+        import src.lib.utils as utils_module
+
+        target = tmp_path / "out.md"
+        target.write_text("old")
+
+        def boom(fd):
+            raise OSError("simulated fsync failure")
+
+        monkeypatch.setattr(utils_module.os, "fsync", boom)
+
+        with pytest.raises(OSError):
+            utils_module._atomic_write_text(target, "new")
+
+        assert target.read_text() == "old"
+        assert [p.name for p in tmp_path.iterdir()] == ["out.md"]
+
     def test_add_entry_new(self, setup_json_env):
         """Adding new entry creates it in JSON file."""
         from src.lib.utils import add_entry_to_references_json, load_references_json
