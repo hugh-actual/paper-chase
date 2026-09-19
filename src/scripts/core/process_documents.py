@@ -10,7 +10,7 @@ import re
 import shutil
 from datetime import datetime
 from pathlib import Path
-from typing import Dict
+from typing import Dict, Optional
 from pypdf import PdfReader
 
 # Configuration is accessed as config.<NAME> so tests can redirect
@@ -22,6 +22,7 @@ from src.lib.steps import StepError
 from src.lib.utils import (
     append_history,
     build_reference_entry,
+    calculate_file_hash,
     regenerate_references_md,
     load_references_json,
     save_references_json,
@@ -44,6 +45,7 @@ class DocumentProcessor:
         self.skipped_large = []
         self.skipped_non_pdf = []
         self.conflicts = []  # Track files with hash/filename conflicts
+        self.relinked = []  # Files that restored an entry's missing file
         self.existing_references = None  # Pre-loaded references for conflict checking
         # references.json is saved after every file; only the first save of
         # the run backs up, so references.json.bak is the pre-run state.
@@ -190,36 +192,13 @@ class DocumentProcessor:
             )
 
             # Check for conflicts against existing references
-            conflicts_found = []
+            conflicts_found, relink_entry = self._check_conflicts(stub)
 
-            hash_conflict = check_hash_conflict(
-                stub["file_hash"], self.existing_references
-            )
-            if hash_conflict:
-                conflicts_found.append(
-                    {
-                        "type": "hash_duplicate",
-                        "existing_filename": hash_conflict["filename"],
-                        "existing_title": hash_conflict.get("title", ""),
-                        "message": f"File hash matches existing entry: {hash_conflict['filename']}",
-                    }
-                )
-
-            filename_conflict = check_filename_conflict(
-                stub["filename"], self.existing_references
-            )
-            if filename_conflict:
-                conflicts_found.append(
-                    {
-                        "type": "filename_collision",
-                        "existing_filename": filename_conflict["filename"],
-                        "existing_title": filename_conflict.get("title", ""),
-                        "message": (
-                            f"Filename would collide with existing: "
-                            f"{filename_conflict['filename']}"
-                        ),
-                    }
-                )
+            # Hash matches an entry whose file is gone: this *is* that file,
+            # so put it back under the entry's name instead of holding it.
+            if relink_entry is not None:
+                self._relink(file_path, relink_entry)
+                return True
 
             # If conflicts found, skip this file and keep in todo/
             if conflicts_found:
@@ -302,6 +281,85 @@ class DocumentProcessor:
         self._save_references(file_path.name)
         return True
 
+    def _check_conflicts(self, stub: dict) -> tuple[list[dict], Optional[dict]]:
+        """Check an incoming file against existing references.
+
+        Returns (conflicts, relink_entry). A hash match is classified by
+        the state of the existing entry's file:
+        - present with the same hash -> `hash_duplicate` (a true duplicate);
+        - missing from reference/ -> relink: the incoming file restores it
+          (returned as relink_entry, no conflict);
+        - name occupied by different content -> `hash_matches_missing_file`
+          (held: restoring it would overwrite that other file).
+        """
+        conflicts = []
+
+        hash_match = check_hash_conflict(stub["file_hash"], self.existing_references)
+        if hash_match:
+            existing_path = config.REFERENCE_DIR / hash_match["filename"]
+            if not existing_path.exists():
+                return [], hash_match
+            present = calculate_file_hash(existing_path) == stub["file_hash"]
+            if present:
+                message = f"File hash matches existing entry: {hash_match['filename']}"
+            else:
+                message = (
+                    f"File hash matches entry {hash_match['filename']}, whose file "
+                    "is missing and whose name is taken by different content"
+                )
+            conflicts.append(
+                {
+                    "type": (
+                        "hash_duplicate" if present else "hash_matches_missing_file"
+                    ),
+                    "existing_filename": hash_match["filename"],
+                    "existing_title": hash_match.get("title", ""),
+                    "existing_file_present": present,
+                    "message": message,
+                }
+            )
+
+        filename_conflict = check_filename_conflict(
+            stub["filename"], self.existing_references
+        )
+        if filename_conflict:
+            conflicts.append(
+                {
+                    "type": "filename_collision",
+                    "existing_filename": filename_conflict["filename"],
+                    "existing_title": filename_conflict.get("title", ""),
+                    "message": (
+                        f"Filename would collide with existing: "
+                        f"{filename_conflict['filename']}"
+                    ),
+                }
+            )
+
+        return conflicts, None
+
+    def _relink(self, file_path: Path, entry: dict) -> None:
+        """Move `file_path` to the missing file of `entry`, keeping the
+        entry's metadata. Journalled before the move, like an ingest."""
+        append_history("relink", **entry, incoming_filename=file_path.name)
+        dest_path = config.REFERENCE_DIR / entry["filename"]
+        try:
+            shutil.move(str(file_path), str(dest_path))
+        except BaseException as e:
+            append_history(
+                "ingest_failed",
+                original_filename=file_path.name,
+                filename=entry["filename"],
+                file_hash=entry["file_hash"],
+                error=str(e) or type(e).__name__,
+            )
+            raise
+        self.relinked.append(
+            {"original_filename": file_path.name, "new_filename": entry["filename"]}
+        )
+        # The entry itself is unchanged, but save as after an ingest so the
+        # run's .bak/atomic-write guarantees cover it too.
+        self._save_references(file_path.name)
+
     def _save_references(self, filename: str = "") -> bool:
         """Save references.json, recording a failure as fatal rather than
         raising (so it can't mask an interrupt already propagating)."""
@@ -380,6 +438,7 @@ class DocumentProcessor:
 
         return {
             "processed": len(self.processed_files),
+            "relinked": len(self.relinked),
             "conflicts": len(self.conflicts),
             "skipped": len(self.skipped_errors),
             "fatal_errors": len(self.fatal_errors),
@@ -435,6 +494,8 @@ class DocumentProcessor:
         print("SUMMARY")
         print("=" * 70)
         print(f"Processed: {len(self.processed_files)} files")
+        if self.relinked:
+            print(f"Relinked: {len(self.relinked)} missing files restored")
         print(f"Conflicts: {len(self.conflicts)} files (kept in todo/)")
         print(f"Failures: {len(self.fatal_errors)}")
         print(f"Skipped: {len(self.skipped_errors)}")
@@ -476,6 +537,7 @@ class DocumentProcessor:
                 )
             f.write("## Summary\n\n")
             f.write(f"- **Total PDFs processed**: {len(self.processed_files)}\n")
+            f.write(f"- **Missing files restored (relinked)**: {len(self.relinked)}\n")
             f.write(
                 f"- **Conflicts detected (kept in todo/)**: {len(self.conflicts)}\n"
             )
@@ -488,6 +550,16 @@ class DocumentProcessor:
             if self.processed_files:
                 f.write("## Ingested Files\n\n")
                 for p in self.processed_files:
+                    f.write(f"- {p['original_filename']} → {p['new_filename']}\n")
+                f.write("\n")
+
+            if self.relinked:
+                f.write("## Relinked Files\n\n")
+                f.write(
+                    "Matched the hash of an entry whose file was missing; "
+                    "restored under the entry's name.\n\n"
+                )
+                for p in self.relinked:
                     f.write(f"- {p['original_filename']} → {p['new_filename']}\n")
                 f.write("\n")
 

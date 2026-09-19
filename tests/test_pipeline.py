@@ -1003,3 +1003,82 @@ class TestRecoverOrphans:
         out = capsys.readouterr().out
         assert "(originally: file1.pdf)" in out
         assert "make recover" in out
+
+
+class TestOrphanAwareHashConflicts:
+    def _orphan_entry(self, content):
+        return {
+            "author": "Jane Smith",
+            "year": "2020",
+            "title": "Great Findings",
+            "publisher": "",
+            "filename": "Smith_Great_Findings.pdf",
+            "original_filename": "first_download.pdf",
+            "file_hash": hashlib.sha256(content).hexdigest(),
+        }
+
+    def test_present_duplicate_reports_file_present(self, sandbox):
+        existing = seed_entry(
+            sandbox, "Doe_Existing_Paper.pdf", "Jane Doe", "Existing Paper"
+        )
+        utils.save_references_json([existing])
+        (sandbox["todo"] / "dup.pdf").write_bytes(DUMMY_PDF)
+
+        processor = DocumentProcessor()
+        processor.run()
+
+        [conflict] = processor.conflicts[0]["conflicts"]
+        assert conflict["type"] == "hash_duplicate"
+        assert conflict["existing_file_present"] is True
+
+    def test_identical_file_restores_missing_entry_file(self, sandbox):
+        """The entry's file is gone; the documented workflow used to call
+        the incoming copy a duplicate and tell the user to delete it -- the
+        only surviving copy. It must be relinked under the entry's name."""
+        content = make_pdf_bytes("Some Other Title", "Someone Else", "1999")
+        entry = self._orphan_entry(content)
+        utils.save_references_json([entry])
+        incoming = sandbox["todo"] / "second_download.pdf"
+        incoming.write_bytes(content)
+
+        processor = DocumentProcessor()
+        result = processor.run()
+
+        assert result["fatal_errors"] == 0
+        assert result["relinked"] == 1
+        assert processor.conflicts == []
+        assert not incoming.exists()
+        restored = sandbox["reference"] / "Smith_Great_Findings.pdf"
+        assert restored.read_bytes() == content
+        # Metadata is the entry's, not re-derived from the incoming file
+        assert utils.load_references_json() == [entry]
+
+        [event] = utils.load_history()
+        assert event["event"] == "relink"
+        assert event["incoming_filename"] == "second_download.pdf"
+        assert event["filename"] == "Smith_Great_Findings.pdf"
+        assert (
+            "second_download.pdf → Smith_Great_Findings.pdf"
+            in (sandbox["markdown"] / "log.md").read_text()
+        )
+
+    def test_occupied_name_is_held(self, sandbox):
+        """If different content now sits at the entry's filename, restoring
+        would overwrite it -- hold the incoming file instead."""
+        content = make_pdf_bytes("Some Other Title", "Someone Else", "1999")
+        entry = self._orphan_entry(content)
+        utils.save_references_json([entry])
+        occupant = sandbox["reference"] / "Smith_Great_Findings.pdf"
+        occupant.write_bytes(b"different content")
+        incoming = sandbox["todo"] / "second_download.pdf"
+        incoming.write_bytes(content)
+
+        processor = DocumentProcessor()
+        result = processor.run()
+
+        assert result["fatal_errors"] == 0
+        assert incoming.exists()
+        assert occupant.read_bytes() == b"different content"
+        [conflict] = processor.conflicts[0]["conflicts"]
+        assert conflict["type"] == "hash_matches_missing_file"
+        assert conflict["existing_file_present"] is False
