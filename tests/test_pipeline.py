@@ -322,6 +322,61 @@ class TestMainExitCodes:
         assert module.main() == expected_exit
 
 
+class TestExtractFromFilename:
+    """Table test for DocumentProcessor.extract_from_filename's pattern
+    matching: existing patterns (regression) plus the T8 fixes -- the
+    YYYY-Author-Title pattern now requires a letter in the author segment,
+    a new "Author et al - Title" pattern, and plausible-years-only
+    extraction in the default branch."""
+
+    @pytest.mark.parametrize(
+        "filename, expected_author, expected_title, expected_year",
+        [
+            # Pattern 1: [Author]Title
+            (
+                "[Hastie]Elements of Statistical Learning.pdf",
+                "Hastie",
+                "Elements of Statistical Learning",
+                None,
+            ),
+            # Pattern 2: YYYY-Author-Title (regression)
+            ("2019-Smith-Great Findings.pdf", "Smith", "Great Findings", "2019"),
+            # Pattern 2 must not match when the author segment has no letter
+            # -- falls through to the default branch instead.
+            ("2019-2020-Annual-Report.pdf", None, "2019-2020-Annual-Report", "2019"),
+            # Pattern 3: YYYY_Book_Title (regression)
+            ("2015_Book_Deep Learning.pdf", None, "Deep Learning", "2015"),
+            ("2015_Article_A Survey.pdf", None, "A Survey", "2015"),
+            # Pattern 4 (new): Author et al - Title
+            (
+                "Smith et al - A Survey of Methods.pdf",
+                "Smith et al",
+                "A Survey of Methods",
+                None,
+            ),
+            ("Jones et al. - Another Paper.pdf", "Jones et al.", "Another Paper", None),
+            # Pattern 5: arxiv number + title (regression)
+            (
+                "1706.03762 Attention Is All You Need.pdf",
+                None,
+                "Attention Is All You Need",
+                None,
+            ),
+            # Default branch: plausible year only, not part of a longer run
+            ("ISBN9780387848570.pdf", None, "ISBN9780387848570", None),
+            ("Paper 1999 final.pdf", None, "Paper 1999 final", "1999"),
+            ("Untitled Notes.pdf", None, "Untitled Notes", None),
+        ],
+    )
+    def test_pattern_table(
+        self, filename, expected_author, expected_title, expected_year
+    ):
+        info = DocumentProcessor().extract_from_filename(filename)
+        assert info["author"] == expected_author
+        assert info["title"] == expected_title
+        assert info["year"] == expected_year
+
+
 class TestDocumentProcessor:
     def test_hash_conflict_keeps_file_in_todo_and_writes_report(self, sandbox):
         existing = seed_entry(

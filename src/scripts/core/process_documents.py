@@ -38,6 +38,21 @@ MAX_FILE_SIZE = 50 * 1024 * 1024  # 50MB in bytes
 GENERIC_TERMS = {"introduction", "guide", "handbook", "manual"}
 
 
+def _extract_plausible_year(text: str) -> Optional[str]:
+    """Find the first plausible 4-digit year in text.
+
+    Excludes matches that are part of a longer digit run (so an ISBN like
+    `9780387848570` never yields a year) and matches outside a sane range,
+    so a random 4-digit code isn't mistaken for a year.
+    """
+    current_year = datetime.now().year
+    for match in re.finditer(r"(?<!\d)(\d{4})(?!\d)", text):
+        year = int(match.group(1))
+        if 1500 <= year <= current_year + 1:
+            return match.group(1)
+    return None
+
+
 class DocumentProcessor:
     def __init__(self):
         self.processed_files = []
@@ -129,9 +144,12 @@ class DocumentProcessor:
             info["title"] = match.group(2).strip()
             return info
 
-        # Pattern 2: YYYY-Author-Title
+        # Pattern 2: YYYY-Author-Title. The author segment must contain at
+        # least one letter, otherwise a filename like
+        # "2019-2020-Annual-Report" would mint an author of "2020" instead
+        # of falling through to a later pattern/the default branch.
         match = re.match(r"(\d{4})-([^-]+)-(.+)", name)
-        if match:
+        if match and re.search(r"[^\W\d_]", match.group(2)):
             info["year"] = match.group(1)
             info["author"] = match.group(2).strip()
             info["title"] = match.group(3).strip()
@@ -144,7 +162,14 @@ class DocumentProcessor:
             info["title"] = match.group(2).strip()
             return info
 
-        # Pattern 4: arxiv number + title
+        # Pattern 4: Author et al - Title
+        match = re.match(r"^(.+?\bet al\.?)\s+-\s+(.+)$", name, re.IGNORECASE)
+        if match:
+            info["author"] = match.group(1).strip()
+            info["title"] = match.group(2).strip()
+            return info
+
+        # Pattern 5: arxiv number + title
         match = re.match(r"(\d{4}\.\d+)\s*(.+)?", name)
         if match:
             info["title"] = match.group(2).strip() if match.group(2) else match.group(1)
@@ -152,11 +177,7 @@ class DocumentProcessor:
 
         # Default: treat whole name as title
         info["title"] = name
-
-        # Try to extract year from anywhere in filename
-        year_match = re.search(r"(\d{4})", name)
-        if year_match:
-            info["year"] = year_match.group(1)
+        info["year"] = _extract_plausible_year(name)
 
         return info
 
