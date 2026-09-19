@@ -13,6 +13,7 @@ from dataclasses import dataclass
 
 from src.lib import config
 from src.lib.utils import (
+    SUGGESTED_FIELDS,
     append_history,
     calculate_file_hash,
     check_duplicate_filename,
@@ -142,7 +143,11 @@ class UpdateStep(ABC):
             "suggested_author": str or None,
             "suggested_title": str or None,
             "suggested_year": str or None,
+            "suggested_publisher": str or None,
         }
+
+        A null suggested_* keeps the current value; any string sets it --
+        so "" clears it (e.g. a bogus publisher).
         """
         pass
 
@@ -164,11 +169,7 @@ class UpdateStep(ABC):
             e
             for e in all_entries
             if e.get("quarantine") is not True
-            and (
-                e.get("suggested_author") is not None
-                or e.get("suggested_title") is not None
-                or e.get("suggested_year") is not None
-            )
+            and any(e.get(field) is not None for field in SUGGESTED_FIELDS)
         ]
 
         # Files are moved one at a time but references.json is saved once,
@@ -395,11 +396,18 @@ class UpdateStep(ABC):
                 if entry.get("suggested_year") is not None
                 else current_year
             )
+            # Any string sets the publisher, so "" clears a bogus one
+            final_publisher = (
+                entry.get("suggested_publisher")
+                if entry.get("suggested_publisher") is not None
+                else current_publisher
+            )
 
             # Track what changed
             author_changed = entry.get("suggested_author") is not None
             title_changed = entry.get("suggested_title") is not None
             year_changed = entry.get("suggested_year") is not None
+            publisher_changed = entry.get("suggested_publisher") is not None
 
             changes = []
             if author_changed:
@@ -408,6 +416,10 @@ class UpdateStep(ABC):
                 changes.append(f"title: '{current_title}' → '{final_title}'")
             if year_changed:
                 changes.append(f"year: '{current_year}' → '{final_year}'")
+            if publisher_changed:
+                changes.append(
+                    f"publisher: '{current_publisher}' → '{final_publisher}'"
+                )
 
             if not changes:
                 continue
@@ -423,25 +435,38 @@ class UpdateStep(ABC):
                 self._record_error("update", filename, "File not found")
                 continue
 
-            # Generate new filename. The file's own name counts as free, so
-            # an update that doesn't change the name keeps it (no `_2`).
-            new_filename, author_names = generate_new_filename(
-                final_author,
-                final_title,
-                self.processed_files,
-                config.REFERENCE_DIR,
-                current_filename=filename,
-            )
-
             # The entry's new values, exactly as they will be stored
-            final_year_clean = final_year if final_year not in ["n.d.", ""] else None
-            new_values = {
-                "author": ", ".join(author_names),
-                "year": final_year_clean or "",
-                "title": final_title,
-                "publisher": current_publisher or "",
-                "filename": new_filename,
-            }
+            if author_changed or title_changed or year_changed:
+                # Generate new filename. The file's own name counts as free,
+                # so an update that doesn't change the name keeps it (no `_2`).
+                new_filename, author_names = generate_new_filename(
+                    final_author,
+                    final_title,
+                    self.processed_files,
+                    config.REFERENCE_DIR,
+                    current_filename=filename,
+                )
+                final_year_clean = (
+                    final_year if final_year not in ["n.d.", ""] else None
+                )
+                new_values = {
+                    "author": ", ".join(author_names),
+                    "year": final_year_clean or "",
+                    "title": final_title,
+                    "publisher": final_publisher or "",
+                    "filename": new_filename,
+                }
+            else:
+                # Publisher-only: it isn't part of the filename, so nothing
+                # else is regenerated -- only the publisher changes.
+                new_filename = filename
+                new_values = {
+                    "author": current_author,
+                    "year": current_year,
+                    "title": current_title,
+                    "publisher": final_publisher,
+                    "filename": filename,
+                }
 
             # Journal before touching the file -- also for a metadata-only
             # update (old_filename == filename), so the history always holds
@@ -576,6 +601,10 @@ class UpdateStep(ABC):
                             changes.append(f"title → {entry['suggested_title']}")
                         if entry.get("suggested_year"):
                             changes.append(f"year → {entry['suggested_year']}")
+                        # "" is a real change here (it clears the publisher)
+                        publisher = entry.get("suggested_publisher")
+                        if publisher is not None:
+                            changes.append(f"publisher → {publisher or '(cleared)'}")
                         if changes:
                             entry_name = entry["filename"]
                             change_list = ", ".join(changes)

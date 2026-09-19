@@ -29,6 +29,8 @@ from src.lib.utils import (  # noqa: E402
     check_hash_conflict,
     check_filename_conflict,
     create_reference_stub,
+    add_annotation_fields,
+    flatten_files_from_pairs,
     PREPOSITIONS,
     DOMAIN_ADJECTIVES,
 )
@@ -568,6 +570,35 @@ class TestConstants:
         """Domain-specific adjectives should be in the set."""
         expected = {"deep", "machine", "neural", "statistical", "bayesian"}
         assert expected.issubset(DOMAIN_ADJECTIVES)
+
+
+class TestAnnotationFields:
+    """suggested_publisher is a first-class annotation field."""
+
+    def test_add_annotation_fields_includes_publisher(self):
+        entries = [{"filename": "A.pdf"}, {"filename": "B.pdf", "quarantine": True}]
+        add_annotation_fields(entries)
+        assert entries[0]["suggested_publisher"] is None
+        assert entries[1]["quarantine"] is True
+        assert entries[1]["suggested_publisher"] is None
+
+    def test_flatten_merges_publisher_and_empty_string_wins(self):
+        """Non-null wins when merging a file seen in two pairs -- including
+        "" (a request to clear the publisher)."""
+        pairs = [
+            {
+                "file1": {"filename": "A.pdf", "suggested_publisher": None},
+                "file2": {"filename": "B.pdf", "suggested_publisher": "Press"},
+            },
+            {
+                "file1": {"filename": "A.pdf", "suggested_publisher": ""},
+                "file2": {"filename": "C.pdf", "suggested_publisher": None},
+            },
+        ]
+        by_name = {f["filename"]: f for f in flatten_files_from_pairs(pairs)}
+        assert by_name["A.pdf"]["suggested_publisher"] == ""
+        assert by_name["B.pdf"]["suggested_publisher"] == "Press"
+        assert by_name["C.pdf"]["suggested_publisher"] is None
 
 
 # =============================================================================

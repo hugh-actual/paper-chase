@@ -577,6 +577,109 @@ class TestUpdateStepFilenames:
         ]
 
 
+class TestSuggestedPublisher:
+    """suggested_publisher: None keeps, any string (including "") sets.
+    Publisher isn't part of the filename, so it alone never renames."""
+
+    def seed(self, sandbox, publisher="PDF Software 1.0"):
+        entry = seed_entry(
+            sandbox, "Doe_Old_Title.pdf", "Jane Doe", "Old Title", content=b"a"
+        )
+        entry["publisher"] = publisher
+        utils.save_references_json([entry])
+        return entry
+
+    def test_empty_string_clears_publisher_without_renaming(self, sandbox):
+        self.seed(sandbox)
+        write_annotations(
+            sandbox,
+            [{"filename": "Doe_Old_Title.pdf", "suggested_publisher": ""}],
+        )
+
+        result = SimpleStep().run()
+
+        assert result["updated"] == 1
+        [stored] = utils.load_references_json()
+        assert stored["publisher"] == ""
+        assert stored["filename"] == "Doe_Old_Title.pdf"
+        assert (stored["author"], stored["title"], stored["year"]) == (
+            "Jane Doe",
+            "Old Title",
+            "2020",
+        )
+        assert [p.name for p in sandbox["reference"].iterdir()] == ["Doe_Old_Title.pdf"]
+
+        [event] = utils.load_history()
+        assert event["event"] == "rename"
+        assert event["old_filename"] == event["filename"] == "Doe_Old_Title.pdf"
+        assert event["publisher"] == ""
+        assert event["previous"]["publisher"] == "PDF Software 1.0"
+
+        log = (sandbox["markdown"] / SimpleStep.log_filename).read_text()
+        assert "publisher → (cleared)" in log
+
+    def test_null_publisher_is_kept(self, sandbox):
+        self.seed(sandbox, publisher="Some Press")
+        write_annotations(
+            sandbox,
+            [
+                {
+                    "filename": "Doe_Old_Title.pdf",
+                    "suggested_year": "1999",
+                    "suggested_publisher": None,
+                }
+            ],
+        )
+
+        SimpleStep().run()
+
+        [stored] = utils.load_references_json()
+        assert stored["publisher"] == "Some Press"
+        assert stored["year"] == "1999"
+
+    def test_publisher_only_null_annotation_is_not_an_update(self, sandbox):
+        self.seed(sandbox)
+        write_annotations(
+            sandbox,
+            [{"filename": "Doe_Old_Title.pdf", "suggested_publisher": None}],
+        )
+
+        result = SimpleStep().run()
+
+        assert result["updated"] == 0
+        assert utils.load_history() == []
+
+    def test_title_and_publisher_update_together(self, sandbox):
+        self.seed(sandbox)
+        write_annotations(
+            sandbox,
+            [
+                {
+                    "filename": "Doe_Old_Title.pdf",
+                    "suggested_title": "New Title",
+                    "suggested_publisher": "Some Press",
+                }
+            ],
+        )
+
+        SimpleStep().run()
+
+        [stored] = utils.load_references_json()
+        assert stored["title"] == "New Title"
+        assert stored["publisher"] == "Some Press"
+        assert stored["filename"] == "Doe_New_Title.pdf"
+        assert (sandbox["reference"] / "Doe_New_Title.pdf").exists()
+        [event] = utils.load_history()
+        assert event["filename"] == "Doe_New_Title.pdf"
+        assert event["publisher"] == "Some Press"
+        assert event["previous"] == {
+            "author": "Jane Doe",
+            "title": "Old Title",
+            "year": "2020",
+            "publisher": "PDF Software 1.0",
+        }
+
+
 UPDATE_MODULES = [
     "src.scripts.updates.update_broken_titles",
     "src.scripts.updates.update_unknown_authors",

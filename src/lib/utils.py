@@ -624,7 +624,12 @@ def rename_file(old_path, new_path):
 # Duplicate detection utilities
 # =============================================================================
 
-SUGGESTED_FIELDS = ("suggested_author", "suggested_title", "suggested_year")
+SUGGESTED_FIELDS = (
+    "suggested_author",
+    "suggested_title",
+    "suggested_year",
+    "suggested_publisher",
+)
 ANNOTATION_FIELDS = ("quarantine",) + SUGGESTED_FIELDS
 
 
