@@ -880,6 +880,7 @@ class TestLooksLikePdfSoftware:
             "Cambridge University Press",
             "Elsevier",
             "Wiley",
+            "Microsoft Press",
         ],
     )
     def test_does_not_flag_plausible_publishers(self, value):

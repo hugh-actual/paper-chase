@@ -976,7 +976,7 @@ _PDF_SOFTWARE_MARKERS = (
     r"acrobat",
     r"adobe pdf library",
     r"distiller",
-    r"microsoft",
+    r"microsoft(?!\s+press)",
     r"quartz pdfcontext",
     r"\bmacos\b",
     r"mac os x",

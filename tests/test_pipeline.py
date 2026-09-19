@@ -718,6 +718,44 @@ class TestMainExitCodes:
         assert module.main() == expected_exit
 
 
+class TestMissingInputJson:
+    """`make update-all` now runs every update step regardless of which
+    detection scripts have actually been run. A step whose input JSON
+    doesn't exist yet (never generated, or generated and found nothing)
+    is routine, not fatal -- steps.py's _read_input_json must return []
+    from load_entries() instead of load_entries() crashing on a bare
+    open(), which would take down the rest of the `make update-all`
+    chain (including `verify`) before it runs."""
+
+    def test_metadata_mismatches_missing_file_exits_zero_and_writes_nothing(
+        self, sandbox, capsys
+    ):
+        from src.scripts.updates import update_metadata_mismatches
+
+        utils.save_references_json([{"filename": "x.pdf"}])
+        before = sandbox["references_json"].read_bytes()
+        assert not (sandbox["json_output"] / "metadata_mismatches.json").exists()
+
+        assert update_metadata_mismatches.main() == 0
+
+        assert sandbox["references_json"].read_bytes() == before
+        assert "run `make find-mismatches`" in capsys.readouterr().out
+
+    def test_broken_titles_missing_file_exits_zero_and_writes_nothing(
+        self, sandbox, capsys
+    ):
+        from src.scripts.updates import update_broken_titles
+
+        utils.save_references_json([{"filename": "x.pdf"}])
+        before = sandbox["references_json"].read_bytes()
+        assert not (sandbox["json_output"] / "broken_titles.json").exists()
+
+        assert update_broken_titles.main() == 0
+
+        assert sandbox["references_json"].read_bytes() == before
+        assert "run `make find-broken`" in capsys.readouterr().out
+
+
 class TestExtractFromFilename:
     """Table test for DocumentProcessor.extract_from_filename's pattern
     matching: existing patterns (regression) plus the T8 fixes -- the
@@ -2109,6 +2147,51 @@ class TestFindMetadataMismatches:
             "original filename suggests a different title",
             "original filename suggests a different year",
         }
+
+    def test_non_junk_title_is_reported_but_not_prefilled(self, sandbox):
+        """A structured-but-lazy filename ("paper_final_v2") must not
+        silently overwrite a good stored title if suggestions are
+        bulk-applied: the mismatch is still reported, but the filename's
+        title goes in the informational filename_title field, not
+        suggested_title, leaving that null for a human to accept."""
+        from src.scripts.detection import find_metadata_mismatches
+
+        utils.save_references_json(
+            [
+                self._entry(
+                    author="Smith",
+                    title="A Genuinely Good Title",
+                    year="2020",
+                    original_filename="[Smith]paper_final_v2.pdf",
+                )
+            ]
+        )
+
+        [result] = find_metadata_mismatches.find_metadata_mismatches()
+        assert result["suggested_title"] is None
+        assert result["filename_title"] == "paper_final_v2"
+        assert "original filename suggests a different title" in result["reasons"]
+
+    def test_non_junk_author_is_reported_but_not_prefilled(self, sandbox):
+        """Same conservatism for author: a differing but non-junk stored
+        author is reported, not overwritten."""
+        from src.scripts.detection import find_metadata_mismatches
+
+        utils.save_references_json(
+            [
+                self._entry(
+                    author="Jones",
+                    title="A Paper",
+                    year="2020",
+                    original_filename="[Smith]A Paper.pdf",
+                )
+            ]
+        )
+
+        [result] = find_metadata_mismatches.find_metadata_mismatches()
+        assert result["suggested_author"] is None
+        assert result["filename_author"] == "Smith"
+        assert "original filename suggests a different author" in result["reasons"]
 
     def test_no_original_filename_is_not_reported(self, sandbox):
         """Nothing wrong except there's no original_filename to compare

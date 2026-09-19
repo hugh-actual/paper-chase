@@ -6,8 +6,6 @@ Update metadata-mismatch entries from metadata_mismatches.json:
 - Rename files and update references.md; handle quarantine.
 """
 
-import json
-
 from src.lib.steps import UpdateStep
 
 
@@ -18,12 +16,11 @@ class UpdateMetadataMismatches(UpdateStep):
     input_filename = "metadata_mismatches.json"
     log_filename = "metadata_mismatches_update_log.md"
     log_title = "Metadata Mismatches Update Log"
+    detect_command = "find-mismatches"
 
     def load_entries(self) -> list[dict]:
         """Load metadata mismatch entries from metadata_mismatches.json."""
-        with open(self.input_file, "r", encoding="utf-8") as f:
-            entries = json.load(f)
-        return entries
+        return self._read_input_json() or []
 
 
 def main():

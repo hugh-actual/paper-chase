@@ -22,6 +22,8 @@ from src.lib import config
 from src.lib.utils import (
     _atomic_write_text,
     add_annotation_fields,
+    is_junk_metadata,
+    is_unknown_author,
     load_references_json,
     looks_like_pdf_software,
     normalize_text,
@@ -51,6 +53,17 @@ def find_filename_mismatches(entry, filename_info):
     Returns (reasons, suggestions) for the fields that differ. Only
     fields the filename actually provides are compared -- a pattern with
     no year, for instance, suggests nothing for year.
+
+    Author/title are pre-filled into suggested_* only when the *stored*
+    value is junk (is_junk_metadata / is_unknown_author). A merely
+    different but otherwise fine stored value is still reported, but the
+    filename's value goes in an informational filename_author/
+    filename_title field instead -- a structured-but-lazy filename (e.g.
+    "[Smith]paper_final_v2.pdf") must not silently overwrite a good
+    title if these suggestions are bulk-applied. Year has no such risk:
+    a stored year mismatch predates T7's fix and came from /CreationDate
+    (the scan date), so the filename year is the more reliable one and
+    is always pre-filled when it differs.
     """
     reasons = []
     suggestions = {}
@@ -58,12 +71,21 @@ def find_filename_mismatches(entry, filename_info):
     filename_author = filename_info.get("author")
     if filename_author and _author_mismatch(entry.get("author", ""), filename_author):
         reasons.append("original filename suggests a different author")
-        suggestions["suggested_author"] = filename_author
+        stored_author = entry.get("author", "")
+        if is_unknown_author(stored_author) or is_junk_metadata(
+            "author", stored_author
+        ):
+            suggestions["suggested_author"] = filename_author
+        else:
+            suggestions["filename_author"] = filename_author
 
     filename_title = filename_info.get("title")
     if filename_title and _norm(entry.get("title", "")) != _norm(filename_title):
         reasons.append("original filename suggests a different title")
-        suggestions["suggested_title"] = filename_title
+        if is_junk_metadata("title", entry.get("title", "")):
+            suggestions["suggested_title"] = filename_title
+        else:
+            suggestions["filename_title"] = filename_title
 
     filename_year = filename_info.get("year")
     if filename_year and _norm(entry.get("year", "")) != _norm(filename_year):

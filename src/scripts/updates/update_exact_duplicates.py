@@ -4,8 +4,6 @@ Update exact duplicate entries from duplicate_candidates.json.
 Processes files with quarantine flags or suggested metadata updates.
 """
 
-import json
-
 from src.lib.steps import UpdateStep
 
 
@@ -16,11 +14,13 @@ class UpdateExactDuplicates(UpdateStep):
     input_filename = "duplicate_candidates.json"
     log_filename = "exact_duplicates_update_log.md"
     log_title = "Exact Duplicates Update Log"
+    detect_command = "detect-dups"
 
     def load_entries(self) -> list[dict]:
         """Load and flatten exact duplicate entries from duplicate_candidates.json."""
-        with open(self.input_file, "r", encoding="utf-8") as f:
-            data = json.load(f)
+        data = self._read_input_json()
+        if data is None:
+            return []
 
         exact_duplicates = data.get("exact_duplicates", [])
 

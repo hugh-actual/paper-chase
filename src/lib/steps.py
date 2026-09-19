@@ -7,6 +7,7 @@ extracting the common quarantine/update/regenerate/log pattern
 that is shared across all update scripts.
 """
 
+import json
 import shutil
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
@@ -66,6 +67,9 @@ class UpdateStep(ABC):
     input_filename: str = ""  # JSON file to read
     log_filename: str = ""  # Log file to write
     log_title: str = ""  # Title for the markdown log
+    # `make` target that generates input_filename, named in the message
+    # _read_input_json prints when it's missing (optional; blank omits it)
+    detect_command: str = ""
 
     def __init__(self):
         self.input_file = config.JSON_OUTPUT_DIR / self.input_filename
@@ -126,6 +130,25 @@ class UpdateStep(ABC):
         through reruns over stale annotations.
         """
         return 1 if cls().run()["fatal_errors"] else 0
+
+    def _read_input_json(self):
+        """Read and parse self.input_file, or None if it doesn't exist yet.
+
+        `make update-all` runs every update step regardless of which
+        detection scripts have actually been run, so a subclass whose
+        detection JSON was never generated (or was generated and found
+        nothing) is routine, not a crash -- a bare `open()` would raise
+        and take down the rest of the chain, including `verify`, before
+        they run. Subclasses' load_entries() treat None as "no entries".
+        """
+        if not self.input_file.exists():
+            hint = (
+                f" -- run `make {self.detect_command}`" if self.detect_command else ""
+            )
+            print(f"No {self.input_filename} yet{hint}.")
+            return None
+        with open(self.input_file, "r", encoding="utf-8") as f:
+            return json.load(f)
 
     @abstractmethod
     def load_entries(self) -> list[dict]:
