@@ -4,8 +4,6 @@ Update Unknown author entries from manual review JSON.
 Updates author, title, year, renames files, handles quarantine.
 """
 
-import json
-
 from src.lib.steps import UpdateStep
 
 
@@ -16,12 +14,11 @@ class UpdateUnknownAuthors(UpdateStep):
     input_filename = "unknown_authors.json"
     log_filename = "unknown_authors_update_log.md"
     log_title = "Unknown Authors Update Log"
+    detect_command = "find-unknown"
 
     def load_entries(self) -> list[dict]:
         """Load unknown author entries from unknown_authors.json."""
-        with open(self.input_file, "r", encoding="utf-8") as f:
-            entries = json.load(f)
-        return entries
+        return self._read_input_json() or []
 
 
 def main():

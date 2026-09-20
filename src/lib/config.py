@@ -39,6 +39,11 @@ MARKDOWN_DIR = _env_path("MARKDOWN_DIR", DOCS_BASE_DIR / "markdown")
 REFERENCES_FILE = _env_path("REFERENCES_FILE", DOCS_BASE_DIR / "references.md")
 REFERENCES_JSON = _env_path("REFERENCES_JSON", DOCS_BASE_DIR / "references.json")
 
+# Append-only journal of every move/rename. Collection data (it records what
+# happened to the files), so it lives beside references.json, not in
+# json-output/. A file, so it is deliberately not in the mkdir loop below.
+HISTORY_FILE = _env_path("HISTORY_FILE", DOCS_BASE_DIR / "history.jsonl")
+
 # JSON output
 JSON_OUTPUT_DIR = _env_path("JSON_OUTPUT_DIR", PROCESSOR_DIR / "json-output")
 

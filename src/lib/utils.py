@@ -8,7 +8,11 @@ managing references.md, and file operations.
 import hashlib
 import re
 import json
+import os
 import shutil
+import sys
+import unicodedata
+from datetime import datetime, timezone
 from difflib import SequenceMatcher
 from pathlib import Path
 from typing import Optional
@@ -55,6 +59,27 @@ DOMAIN_ADJECTIVES = {
 }
 
 # =============================================================================
+# Unicode normalisation
+# =============================================================================
+
+
+def normalize_text(value):
+    """NFC-normalise Unicode text.
+
+    macOS decomposes accented characters into a base letter plus a
+    combining mark (NFD) in filenames it hands back (e.g. "Über" becomes
+    "U" + COMBINING DIAERESIS + "ber"). A combining mark alone isn't a
+    `\\w` character, so sanitize_title's character filtering silently drops
+    it, corrupting the accented letter. Normalising to NFC at every entry
+    point folds it back into a single precomposed character before that
+    filtering runs. Falsy/non-string values pass through unchanged.
+    """
+    if not value:
+        return value
+    return unicodedata.normalize("NFC", value)
+
+
+# =============================================================================
 # Author parsing
 # =============================================================================
 
@@ -71,7 +96,7 @@ def parse_author(author_str):
     if not author_str or author_str == "Unknown":
         return "Unknown", ["Unknown"]
 
-    author_str = author_str.strip()
+    author_str = normalize_text(author_str).strip()
 
     # Remove invalid filename characters (but keep for bibliography)
     author_str_clean = re.sub(r'[/\\<>:"|?*]', " ", author_str)
@@ -139,6 +164,8 @@ def sanitize_title(title):
     """
     if not title:
         return "Untitled"
+
+    title = normalize_text(title)
 
     # Remove special characters, keep alphanumeric and spaces
     title = re.sub(r"[^\w\s-]", " ", title)
@@ -214,10 +241,235 @@ def load_references_json():
         return json.load(f)
 
 
-def save_references_json(entries):
-    """Save all references to JSON file."""
-    with open(config.REFERENCES_JSON, "w", encoding="utf-8") as f:
-        json.dump(entries, f, indent=2, ensure_ascii=False)
+def atomic_write_text(path, text):
+    """Replace `path` with `text` so a crash never leaves it truncated.
+
+    The text goes to a sibling temp file first (same directory, so the final
+    os.replace is an atomic rename on one filesystem), is fsynced, and only
+    then swapped in. Readers see either the old file or the new one, never
+    a half-written mix.
+    """
+    path = Path(path)
+    tmp_path = path.with_name(path.name + ".tmp")
+    try:
+        with open(tmp_path, "w", encoding="utf-8") as f:
+            f.write(text)
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(tmp_path, path)
+    except BaseException:
+        tmp_path.unlink(missing_ok=True)
+        raise
+
+
+def save_references_json(entries, backup: bool = True):
+    """Save all references to JSON file, keeping the previous version.
+
+    Serialised before anything on disk is touched, so an entry that can't
+    be encoded fails with references.json (and its .bak) untouched. The
+    previous file is copied to references.json.bak (unless `backup` is
+    False), then replaced atomically -- references.json is the only record
+    of every file's original name and hash, so it must never be left
+    truncated. Callers that save repeatedly during one run pass
+    backup=False after their first save, so .bak keeps the pre-run state.
+    """
+    text = json.dumps(entries, indent=2, ensure_ascii=False)
+    if backup and config.REFERENCES_JSON.exists():
+        backup_path = config.REFERENCES_JSON.with_name(
+            config.REFERENCES_JSON.name + ".bak"
+        )
+        shutil.copy2(config.REFERENCES_JSON, backup_path)
+    atomic_write_text(config.REFERENCES_JSON, text)
+
+
+def append_history(event, **fields):
+    """Append one event to the history journal (config.HISTORY_FILE).
+
+    The journal is the durable record of what happened to each file --
+    written *before* a move, so even a crash between the move and the next
+    references.json save leaves the original name and hash recoverable.
+    It is append-only: nothing ever rewrites it.
+
+    Each event is one JSON line carrying `event`, a UTC `ts`, and `fields`.
+    It is flushed and fsynced before returning.
+    """
+    record = {
+        "event": event,
+        "ts": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+        **fields,
+    }
+    line = (json.dumps(record, ensure_ascii=False) + "\n").encode("utf-8")
+
+    # Binary so the one-byte look-behind below can't land mid-character.
+    # Append mode sends every write to the end regardless of the seek.
+    with open(config.HISTORY_FILE, "ab+") as f:
+        # A previous append torn mid-line (power loss) would otherwise have
+        # this record glued onto it, losing both. Start a fresh line instead;
+        # load_history() then reports the torn fragment rather than hiding it.
+        f.seek(0, os.SEEK_END)
+        if f.tell() > 0:
+            f.seek(-1, os.SEEK_END)
+            if f.read(1) != b"\n":
+                line = b"\n" + line
+        f.write(line)
+        f.flush()
+        os.fsync(f.fileno())
+
+
+def noop(*_args, **_kwargs):
+    """Do nothing -- the "move" for a journalled change that only rewrites
+    metadata, so it still goes through journalled_move."""
+
+
+class HistoryWriteError(Exception):
+    """The journal entry for a move could not be written, so the move was
+    not attempted. Distinct from a failure of the move itself, which
+    callers report differently."""
+
+
+def journalled_move(event, move, *move_args, failed_event=None, **fields):
+    """Journal `event`, then perform `move` -- the order this whole
+    pipeline depends on.
+
+    The journal entry is written first, so a crash between the two leaves
+    a record of what was *meant* to happen (which `make recover` can act
+    on); if the move then raises -- including on Ctrl-C, hence
+    BaseException -- a compensating `<event>_failed` entry is written
+    before the exception propagates, so the journal never claims a move
+    that did not happen.
+
+    A failure of the *first* write propagates to the caller, which must
+    not then move the file. A failure of the compensating write is
+    reported through `on_journal_failure` (if given) rather than raised,
+    because the move failure already propagating is the more important
+    one.
+    """
+    on_journal_failure = fields.pop("on_journal_failure", None)
+    try:
+        append_history(event, **fields)
+    except Exception as e:
+        raise HistoryWriteError(str(e)) from e
+    try:
+        move(*move_args)
+    except BaseException as e:
+        try:
+            append_history(
+                failed_event or f"{event}_failed",
+                **fields,
+                error=str(e) or type(e).__name__,
+            )
+        except Exception as journal_error:  # pragma: no cover - rare
+            if on_journal_failure is not None:
+                on_journal_failure(journal_error)
+        raise
+
+
+def load_json_or_none(path):
+    """Parse a JSON file, or None when it doesn't exist yet.
+
+    Detection output is optional by design: a step whose detection script
+    has never run is a routine "nothing to do", not a crash.
+    """
+    path = Path(path)
+    if not path.exists():
+        return None
+    with open(path, "r", encoding="utf-8") as f:
+        return json.load(f)
+
+
+def load_history():
+    """Load every event from the history journal, oldest first.
+
+    Malformed lines are skipped with a warning on stderr naming them. A
+    torn append (power loss mid-write) leaves a fragment that the next
+    append_history() pushes mid-file, so refusing to load past one would
+    make the journal unreadable exactly when recovery needs it.
+    Returns [] if the journal doesn't exist yet.
+    """
+    if not config.HISTORY_FILE.exists():
+        return []
+
+    events = []
+    bad_lines = []
+    lines = config.HISTORY_FILE.read_text(encoding="utf-8").splitlines()
+    for i, line in enumerate(lines, 1):
+        if not line.strip():
+            continue
+        try:
+            events.append(json.loads(line))
+        except json.JSONDecodeError:
+            bad_lines.append(i)
+    if bad_lines:
+        print(
+            f"Warning: skipped malformed line(s) {', '.join(map(str, bad_lines))} "
+            f"in {config.HISTORY_FILE}",
+            file=sys.stderr,
+        )
+    return events
+
+
+def latest_history_event(history, events, **match):
+    """Return the most recent event in `history` whose type is in `events`
+    and whose fields equal every `match` key/value, or None."""
+    for record in reversed(history):
+        if record.get("event") in events and all(
+            record.get(k) == v for k, v in match.items()
+        ):
+            return record
+    return None
+
+
+# History events whose `filename` is where a file ended up in reference/
+PLACING_EVENTS = ("ingest", "rename", "relink")
+
+# Guard against a (malformed) rename cycle when following a chain
+MAX_RENAME_HOPS = 50
+
+
+def explain_orphan(history, filename, file_hash):
+    """The latest event that placed `filename` with this hash, or None."""
+    if not file_hash:
+        return None
+    return latest_history_event(
+        history, PLACING_EVENTS, filename=filename, file_hash=file_hash
+    )
+
+
+def explain_missing_file(history, entry):
+    """Explain where a missing entry's file went.
+
+    Returns ("renamed", event) for the rename chain's last hop whose target
+    exists on disk with the recorded hash, ("quarantined", event) when a
+    quarantine event moved it out and the quarantined file exists, or
+    (None, None) when history doesn't explain it.
+    """
+    filename = entry["filename"]
+    file_hash = entry.get("file_hash")
+    renamed = None
+
+    for _ in range(MAX_RENAME_HOPS):
+        match = {"filename": filename}
+        if file_hash:
+            match["file_hash"] = file_hash
+        quarantine = latest_history_event(history, ("quarantine",), **match)
+        if quarantine and quarantine.get("quarantine_filename"):
+            if (config.QUARANTINE_DIR / quarantine["quarantine_filename"]).exists():
+                return "quarantined", quarantine
+
+        match = {"old_filename": filename}
+        if file_hash:
+            match["file_hash"] = file_hash
+        rename = latest_history_event(history, ("rename",), **match)
+        if not rename or not rename.get("file_hash"):
+            break
+        file_hash = rename["file_hash"]
+        filename = rename["filename"]
+        target = config.REFERENCE_DIR / filename
+        if target.exists() and calculate_file_hash(target) == file_hash:
+            renamed = rename
+            # Keep following: the file may have been renamed again
+
+    return ("renamed", renamed) if renamed else (None, None)
 
 
 def build_reference_entry(
@@ -359,29 +611,45 @@ def get_entry_from_references_json(filename):
 # =============================================================================
 
 
-def check_duplicate_filename(new_filename, processed_files, target_dir=None):
-    """Check if filename already exists, add suffix if needed."""
+def check_duplicate_filename(
+    new_filename, processed_files, target_dir=None, current_filename=None
+):
+    """Check if filename already exists, add suffix if needed.
+
+    `current_filename` is the name the file being renamed already has: it
+    is on disk (or reserved earlier this run) only because it *is* this
+    file, so it counts as free. Without that, renaming a file to its own
+    name would suffix it (`X.pdf` -> `X_2.pdf`). Every other name on disk
+    or in `processed_files` is still taken.
+    """
     if target_dir is None:
         target_dir = config.REFERENCE_DIR
 
-    if new_filename not in processed_files and not (target_dir / new_filename).exists():
+    def taken(name):
+        if name == current_filename:
+            return False
+        return name in processed_files or (target_dir / name).exists()
+
+    if not taken(new_filename):
         return new_filename
 
     base, ext = new_filename.rsplit(".", 1)
     counter = 2
-    while (
-        f"{base}_{counter}.{ext}" in processed_files
-        or (target_dir / f"{base}_{counter}.{ext}").exists()
-    ):
+    while taken(f"{base}_{counter}.{ext}"):
         counter += 1
 
     return f"{base}_{counter}.{ext}"
 
 
-def generate_new_filename(author, title, processed_files=None, target_dir=None):
+def generate_new_filename(
+    author, title, processed_files=None, target_dir=None, current_filename=None
+):
     """
     Generate a new filename from author and title.
     Returns (new_filename, author_names_list).
+
+    Pass `current_filename` when renaming an existing file, so its own
+    name isn't treated as taken (see check_duplicate_filename).
     """
     if processed_files is None:
         processed_files = set()
@@ -398,7 +666,9 @@ def generate_new_filename(author, title, processed_files=None, target_dir=None):
         title_filename = "_".join(title_filename.split("_")[:10])
         new_filename = f"{author_filename}_{title_filename}.pdf"
 
-    new_filename = check_duplicate_filename(new_filename, processed_files, target_dir)
+    new_filename = check_duplicate_filename(
+        new_filename, processed_files, target_dir, current_filename
+    )
 
     return new_filename, author_names
 
@@ -417,7 +687,12 @@ def rename_file(old_path, new_path):
 # Duplicate detection utilities
 # =============================================================================
 
-SUGGESTED_FIELDS = ("suggested_author", "suggested_title", "suggested_year")
+SUGGESTED_FIELDS = (
+    "suggested_author",
+    "suggested_title",
+    "suggested_year",
+    "suggested_publisher",
+)
 ANNOTATION_FIELDS = ("quarantine",) + SUGGESTED_FIELDS
 
 
@@ -710,6 +985,129 @@ def is_unknown_author(author: str) -> bool:
         return True
     author_lower = author.strip().lower()
     return author_lower in ["unknown", "---", "null", ""]
+
+
+_JUNK_TITLE_PREFIX_RE = re.compile(r"^Microsoft\s+\S+\s*-\s*", re.IGNORECASE)
+_JUNK_TITLE_SUFFIX_RE = re.compile(r"\.(docx|doc|tex|dvi|pdf|ps)$", re.IGNORECASE)
+_JUNK_TITLE_VALUES = {"untitled", "untitled document"}
+_JUNK_AUTHOR_VALUES = {"administrator", "admin", "user", "owner", "unknown", "author"}
+
+
+def is_junk_metadata(field: str, value: Optional[str]) -> bool:
+    """Check whether an embedded-PDF metadata value is generic junk that
+    should never outrank a well-formed filename or be treated as real
+    metadata (e.g. `/Title` "Microsoft Word - draft3.doc", `/Author`
+    "Administrator" left by a scanner or an unsaved default).
+
+    Deliberately generic only -- collection-specific junk patterns (real
+    titles, filenames) belong in the untracked local-patterns file, not
+    here.
+
+    Args:
+        field: "title" or "author".
+        value: The metadata value to check.
+    """
+    if not value or not str(value).strip():
+        return True
+    v = str(value).strip()
+
+    if field == "title":
+        if _JUNK_TITLE_PREFIX_RE.match(v):
+            return True
+        if _JUNK_TITLE_SUFFIX_RE.search(v):
+            return True
+        return v.lower() in _JUNK_TITLE_VALUES
+
+    if field == "author":
+        return v.lower() in _JUNK_AUTHOR_VALUES
+
+    return False
+
+
+# Generic markers left by the software that produced a PDF, not by a
+# publisher. Collection-specific publisher quirks don't belong here --
+# this list is deliberately generic.
+_PDF_SOFTWARE_MARKERS = (
+    r"pdftex",
+    r"\blatex\b",
+    r"\btex\b",
+    r"dvips",
+    r"dvipdf",
+    r"xdvipdf",
+    r"ghostscript",
+    r"acrobat",
+    r"adobe pdf library",
+    r"distiller",
+    r"quartz pdfcontext",
+    r"\bmacos\b",
+    r"mac os x",
+    r"skia/pdf",
+    r"pdfium",
+    r"itext",
+    r"pypdf",
+    r"reportlab",
+    r"libreoffice",
+    r"openoffice",
+    r"wkhtmltopdf",
+    r"pscript",
+    r"abbyy",
+    r"scansoft",
+)
+_PDF_SOFTWARE_RE = re.compile("|".join(_PDF_SOFTWARE_MARKERS), re.IGNORECASE)
+
+# Words that name PDF-producing software *and* real publishers or
+# institutions ("Xerox PARC", "The American University in Cairo Press",
+# "Microsoft Research", "Nitro Publishing"). A bare word match would clear
+# a correct publisher, so these only count alongside producer-shaped
+# context -- a version number or a device/application word -- and never
+# when the value reads like a publisher's name.
+_AMBIGUOUS_SOFTWARE_MARKERS = (
+    r"\bcairo\b",
+    r"\bcanon\b",
+    r"\bmicrosoft\b",
+    r"\bnitro\b",
+    r"\bprince\b",
+    r"\bxerox\b",
+)
+_AMBIGUOUS_SOFTWARE_RE = re.compile(
+    "|".join(_AMBIGUOUS_SOFTWARE_MARKERS), re.IGNORECASE
+)
+_PRODUCER_CONTEXT_RE = re.compile(
+    r"\d|\bpdf\b|print to|distiller|workcentre|imagerunner|primo|"
+    r"\bscan\w*|\bcreator\b|\bwriter\b|\bdriver\b|\bword\b|"
+    r"powerpoint|\bexcel\b|\boffice\b|\bxml\b",
+    re.IGNORECASE,
+)
+_PUBLISHER_HINT_RE = re.compile(
+    r"\bpress\b|\bpublish\w*|\buniversity\b|\bbooks?\b|\bverlag\b|"
+    r"\beditions?\b|\bimprint\b|\bjournals?\b|\bsociety\b|"
+    r"\bassociation\b|\binstitute\b|\bfoundation\b",
+    re.IGNORECASE,
+)
+_PDF_VERSION_RE = re.compile(r"\bpdf\s*[\d.]+", re.IGNORECASE)
+
+
+def looks_like_pdf_software(value: Optional[str]) -> bool:
+    """Check whether a `publisher` value looks like PDF-producing software
+    (embedded-PDF `/Producer` strings such as "pdfTeX-1.40.21", "Adobe
+    Acrobat Pro DC", "Microsoft: Print To PDF") rather than a real
+    publisher. Used by find_metadata_mismatches to flag entries whose
+    publisher should be cleared.
+
+    Deliberately generic only -- see is_junk_metadata.
+    """
+    if not value or not str(value).strip():
+        return False
+    v = str(value).strip()
+    if _PDF_SOFTWARE_RE.search(v) or _PDF_VERSION_RE.search(v):
+        return True
+    # An ambiguous word only counts as software when the rest of the value
+    # looks like a producer string and not like a publisher's name.
+    return bool(
+        _AMBIGUOUS_SOFTWARE_RE.search(v)
+        and _PRODUCER_CONTEXT_RE.search(v)
+        and not _PUBLISHER_HINT_RE.search(v)
+    )
 
 
 def is_suspect_filename(filename: str) -> bool:

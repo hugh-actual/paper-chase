@@ -13,6 +13,13 @@ from dataclasses import dataclass
 
 from src.lib import config
 from src.lib.utils import (
+    SUGGESTED_FIELDS,
+    HistoryWriteError,
+    journalled_move,
+    load_json_or_none,
+    noop,
+    calculate_file_hash,
+    check_duplicate_filename,
     generate_new_filename,
     rename_file,
     load_references_json,
@@ -39,7 +46,55 @@ class StepError:
     fatal: bool
 
 
-class UpdateStep(ABC):
+class ErrorTrackingStep:
+    """Shared bookkeeping for the two classes that move files in batches:
+    UpdateStep and DocumentProcessor.
+
+    Both record what went wrong as StepErrors, split failures from routine
+    skips the same way, and translate that into the same exit code -- so
+    the rules live here once rather than being kept in sync by hand.
+    """
+
+    def __init__(self):
+        # Single record of everything that went wrong. The per-phase and
+        # fatal views below are derived from it, so they cannot drift.
+        self.errors: list[StepError] = []
+
+    def _record_error(
+        self, phase: str, filename: str, message: str, fatal: bool = False
+    ) -> None:
+        """Record a failure or a skip. See StepError for the distinction."""
+        self.errors.append(StepError(phase, filename, message, fatal))
+
+    def _errors_in(self, phase: str) -> list[StepError]:
+        return [e for e in self.errors if e.phase == phase]
+
+    @property
+    def fatal_errors(self) -> list[StepError]:
+        return [e for e in self.errors if e.fatal]
+
+    @property
+    def skipped_errors(self) -> list[StepError]:
+        return [e for e in self.errors if not e.fatal]
+
+    @staticmethod
+    def _describe(err: StepError) -> str:
+        """One-line rendering of an error, including which phase it came from."""
+        where = f"{err.phase}/{err.filename}" if err.filename else err.phase
+        return f"[{where}] {err.message}"
+
+    @classmethod
+    def run_as_main(cls) -> int:
+        """Entry point for `python -m`: nonzero only on genuine failures.
+
+        Routine skips still exit 0, so `make ingest` and `make update-all`
+        keep chaining through reruns over stale annotations rather than
+        halting on a harmless "already applied".
+        """
+        return 1 if cls().run()["fatal_errors"] else 0
+
+
+class UpdateStep(ErrorTrackingStep, ABC):
     """
     Base class for update scripts that process annotated JSON files.
 
@@ -62,6 +117,9 @@ class UpdateStep(ABC):
     input_filename: str = ""  # JSON file to read
     log_filename: str = ""  # Log file to write
     log_title: str = ""  # Title for the markdown log
+    # `make` target that generates input_filename, named in the message
+    # _read_input_json prints when it's missing (optional; blank omits it)
+    detect_command: str = ""
 
     def __init__(self):
         self.input_file = config.JSON_OUTPUT_DIR / self.input_filename
@@ -72,21 +130,12 @@ class UpdateStep(ABC):
         self.updated = 0
         self.processed_files = set()
 
-        # Single record of everything that went wrong. The per-phase and
-        # fatal views below are derived from it, so they cannot drift.
-        self.errors: list[StepError] = []
+        super().__init__()
 
         # Loaded once in run(), mutated in memory, saved once at the end
+        # (or on interruption -- see run())
         self.references = []
-
-    def _record_error(
-        self, phase: str, filename: str, message: str, fatal: bool = False
-    ) -> None:
-        """Record a failure or a skip. See StepError for the distinction."""
-        self.errors.append(StepError(phase, filename, message, fatal))
-
-    def _errors_in(self, phase: str) -> list[StepError]:
-        return [e for e in self.errors if e.phase == phase]
+        self.interrupted = False
 
     @property
     def quarantine_errors(self) -> list[StepError]:
@@ -97,14 +146,6 @@ class UpdateStep(ABC):
         return self._errors_in("update")
 
     @property
-    def fatal_errors(self) -> list[StepError]:
-        return [e for e in self.errors if e.fatal]
-
-    @property
-    def skipped_errors(self) -> list[StepError]:
-        return [e for e in self.errors if not e.fatal]
-
-    @property
     def quarantine_error_files(self) -> set:
         return {e.filename for e in self.quarantine_errors}
 
@@ -112,14 +153,23 @@ class UpdateStep(ABC):
     def update_error_files(self) -> set:
         return {e.filename for e in self.update_errors}
 
-    @classmethod
-    def run_as_main(cls) -> int:
-        """Entry point for `python -m`: nonzero only on genuine failures.
+    def _read_input_json(self):
+        """Read and parse self.input_file, or None if it doesn't exist yet.
 
-        Routine skips still exit 0, so `make update-all` keeps chaining
-        through reruns over stale annotations.
+        `make update-all` runs every update step regardless of which
+        detection scripts have actually been run, so a subclass whose
+        detection JSON was never generated (or was generated and found
+        nothing) is routine, not a crash -- a bare `open()` would raise
+        and take down the rest of the chain, including `verify`, before
+        they run. Subclasses' load_entries() treat None as "no entries".
         """
-        return 1 if cls().run()["fatal_errors"] else 0
+        data = load_json_or_none(self.input_file)
+        if data is None:
+            hint = (
+                f" -- run `make {self.detect_command}`" if self.detect_command else ""
+            )
+            print(f"No {self.input_filename} yet{hint}.")
+        return data
 
     @abstractmethod
     def load_entries(self) -> list[dict]:
@@ -137,7 +187,11 @@ class UpdateStep(ABC):
             "suggested_author": str or None,
             "suggested_title": str or None,
             "suggested_year": str or None,
+            "suggested_publisher": str or None,
         }
+
+        A null suggested_* keeps the current value; any string sets it --
+        so "" clears it (e.g. a bogus publisher).
         """
         pass
 
@@ -154,51 +208,40 @@ class UpdateStep(ABC):
         self.references = load_references_json()
         print(f"Total entries to process: {len(all_entries)}\n")
 
-        # Phase 1: Quarantine
         quarantine_entries = [e for e in all_entries if e.get("quarantine") is True]
-        if quarantine_entries:
-            print("PHASE 1: Processing quarantine entries...")
-            print("-" * 70)
-            print(f"Files to quarantine: {len(quarantine_entries)}\n")
-            self._process_quarantine(quarantine_entries)
-            print(f"\nPhase 1 Complete: {self.quarantined} files quarantined\n")
-
-        # Phase 2: Updates
         update_entries = [
             e
             for e in all_entries
             if e.get("quarantine") is not True
-            and (
-                e.get("suggested_author") is not None
-                or e.get("suggested_title") is not None
-                or e.get("suggested_year") is not None
-            )
+            and any(e.get(field) is not None for field in SUGGESTED_FIELDS)
         ]
-        if update_entries:
-            print("PHASE 2: Processing metadata updates...")
-            print("-" * 70)
-            print(f"Files to update: {len(update_entries)}\n")
-            self._process_updates(update_entries)
-            print(f"\nPhase 2 Complete: {self.updated} files updated\n")
 
-        # Phase 3: Save references.json and regenerate references.md
-        if self.quarantined > 0 or self.updated > 0:
-            save_references_json(self.references)
-            print("Generating references.md...")
-            if regenerate_references_md():
-                print("  ✓ references.md generated\n")
-            else:
-                print("  ⚠ Warning: generate_references_md.py failed\n")
-                # references.json now describes changes references.md doesn't
-                # reflect, and `verify` compares the filesystem against the
-                # JSON only -- so nothing downstream would catch this.
-                self._record_error(
-                    "output", "", "Failed to regenerate references.md", fatal=True
-                )
+        # Files are moved one at a time but references.json is saved once,
+        # in _finish(). The finally makes sure an interrupted run (Ctrl-C is
+        # a BaseException, so no `except Exception` sees it) still saves
+        # what it has already moved, and writes its log, before the
+        # interrupt propagates -- otherwise moved files would be left with
+        # entries still pointing at their old names.
+        completed = False
+        try:
+            # Phase 1: Quarantine
+            if quarantine_entries:
+                print("PHASE 1: Processing quarantine entries...")
+                print("-" * 70)
+                print(f"Files to quarantine: {len(quarantine_entries)}\n")
+                self._process_quarantine(quarantine_entries)
+                print(f"\nPhase 1 Complete: {self.quarantined} files quarantined\n")
 
-        # Phase 4: Summary and log
-        self._print_summary(len(all_entries))
-        self._write_log(all_entries, quarantine_entries, update_entries)
+            # Phase 2: Updates
+            if update_entries:
+                print("PHASE 2: Processing metadata updates...")
+                print("-" * 70)
+                print(f"Files to update: {len(update_entries)}\n")
+                self._process_updates(update_entries)
+                print(f"\nPhase 2 Complete: {self.updated} files updated\n")
+            completed = True
+        finally:
+            self._finish(all_entries, quarantine_entries, update_entries, completed)
 
         return {
             "total": len(all_entries),
@@ -209,36 +252,126 @@ class UpdateStep(ABC):
             "fatal_errors": len(self.fatal_errors),
         }
 
+    def _finish(
+        self,
+        all_entries: list[dict],
+        quarantine_entries: list[dict],
+        update_entries: list[dict],
+        completed: bool,
+    ) -> None:
+        """Phases 3-4: save, regenerate, summarise and log -- on success and
+        on interruption alike. Runs inside a finally, so every failure here
+        is recorded as fatal rather than raised: raising would replace an
+        interrupt that is already propagating."""
+        self.interrupted = not completed
+        if not completed:
+            print("\n⚠ Interrupted -- saving progress before exiting...")
+
+        # Phase 3: Save references.json and regenerate references.md
+        if self.quarantined > 0 or self.updated > 0:
+            try:
+                save_references_json(self.references)
+                saved = True
+            except Exception as e:
+                print(f"  [!] Error saving references.json: {e}")
+                self._record_error(
+                    "output", "", f"Failed to save references.json: {e}", fatal=True
+                )
+                saved = False
+
+            if saved:
+                print("Generating references.md...")
+                try:
+                    regenerated = regenerate_references_md()
+                except Exception as e:
+                    print(f"  [!] Error: {e}")
+                    regenerated = False
+                if regenerated:
+                    print("  ✓ references.md generated\n")
+                else:
+                    print("  ⚠ Warning: generate_references_md.py failed\n")
+                    # references.json now describes changes references.md doesn't
+                    # reflect, and `verify` compares the filesystem against the
+                    # JSON only -- so nothing downstream would catch this.
+                    self._record_error(
+                        "output", "", "Failed to regenerate references.md", fatal=True
+                    )
+
+        # Phase 4: Summary and log
+        self._print_summary(len(all_entries))
+        try:
+            self._write_log(all_entries, quarantine_entries, update_entries)
+        except Exception as e:
+            print(f"  [!] Error writing {self.log_filename}: {e}")
+            self._record_error(
+                "output", "", f"Failed to write {self.log_filename}: {e}", fatal=True
+            )
+
     def _process_quarantine(self, entries: list[dict]) -> None:
-        """Process quarantine entries: move files and remove from references.json."""
+        """Process quarantine entries: move files and remove from references.json.
+
+        Each move is journalled first, with the full removed entry, so the
+        file's original name and hash survive its removal from
+        references.json. Never overwrites a file already in quarantine/.
+        """
         for entry in entries:
             filename = entry["filename"]
             print(f"  Quarantining: {filename}")
 
             old_path = config.REFERENCE_DIR / filename
-            new_path = config.QUARANTINE_DIR / filename
 
             if not old_path.exists():
                 print(f"    [!] File not found: {filename}")
                 self._record_error("quarantine", filename, "File not found")
                 continue
 
+            current_entry = next(
+                (e for e in self.references if e["filename"] == filename), None
+            )
+            # An unlisted file is still moved (as before); journal what is
+            # known about it so it can be traced in quarantine/.
+            removed_entry = current_entry or {
+                "filename": filename,
+                "file_hash": calculate_file_hash(old_path),
+            }
+
+            target_name = check_duplicate_filename(
+                filename, set(), config.QUARANTINE_DIR
+            )
+
             try:
-                shutil.move(str(old_path), str(new_path))
+                journalled_move(
+                    "quarantine",
+                    shutil.move,
+                    str(old_path),
+                    str(config.QUARANTINE_DIR / target_name),
+                    on_journal_failure=lambda e: self._record_error(
+                        "output", filename, f"Failed to write history: {e}", fatal=True
+                    ),
+                    **{**removed_entry, "quarantine_filename": target_name},
+                )
 
-                # Remove from the in-memory references
-                remaining = [e for e in self.references if e["filename"] != filename]
-
-                if len(remaining) < len(self.references):
-                    self.references = remaining
+                # Drop the entry immediately after the move succeeds
+                if current_entry is not None:
+                    self.references = [
+                        e for e in self.references if e["filename"] != filename
+                    ]
                     self.quarantined += 1
-                    print("    ✓ Moved to quarantine/")
+                    print(f"    ✓ Moved to quarantine/{target_name}")
                 else:
                     print("    [!] Warning: Entry not found in references.json")
                     self._record_error(
                         "quarantine", filename, "Entry not in references.json"
                     )
 
+            except HistoryWriteError as e:
+                print(f"    [!] Error writing history, file not moved: {e}")
+                self._record_error(
+                    "quarantine",
+                    filename,
+                    f"Failed to write history, file not moved: {e}",
+                    fatal=True,
+                )
             except Exception as e:
                 print(f"    [!] Error: {e}")
                 self._record_error("quarantine", filename, str(e), fatal=True)
@@ -285,11 +418,18 @@ class UpdateStep(ABC):
                 if entry.get("suggested_year") is not None
                 else current_year
             )
+            # Any string sets the publisher, so "" clears a bogus one
+            final_publisher = (
+                entry.get("suggested_publisher")
+                if entry.get("suggested_publisher") is not None
+                else current_publisher
+            )
 
             # Track what changed
             author_changed = entry.get("suggested_author") is not None
             title_changed = entry.get("suggested_title") is not None
             year_changed = entry.get("suggested_year") is not None
+            publisher_changed = entry.get("suggested_publisher") is not None
 
             changes = []
             if author_changed:
@@ -298,6 +438,10 @@ class UpdateStep(ABC):
                 changes.append(f"title: '{current_title}' → '{final_title}'")
             if year_changed:
                 changes.append(f"year: '{current_year}' → '{final_year}'")
+            if publisher_changed:
+                changes.append(
+                    f"publisher: '{current_publisher}' → '{final_publisher}'"
+                )
 
             if not changes:
                 continue
@@ -313,46 +457,90 @@ class UpdateStep(ABC):
                 self._record_error("update", filename, "File not found")
                 continue
 
-            # Generate new filename
-            new_filename, author_names = generate_new_filename(
-                final_author, final_title, self.processed_files, config.REFERENCE_DIR
-            )
-
-            # Rename file first so the metadata never points at a missing file
-            if filename != new_filename:
-                new_path = config.REFERENCE_DIR / new_filename
-                try:
-                    rename_file(old_path, new_path)
-                    print(f"    ✓ Renamed to: {new_filename}")
-                except Exception as e:
-                    print(f"    [!] Error renaming file: {e}")
-                    self._record_error(
-                        "update", filename, f"Error renaming: {e}", fatal=True
-                    )
-                    continue
-            else:
-                print("    ✓ Metadata updated (filename unchanged)")
-
-            # Update the in-memory entry
-            final_year_clean = final_year if final_year not in ["n.d.", ""] else None
-            current_entry.update(
-                {
+            # The entry's new values, exactly as they will be stored
+            if author_changed or title_changed or year_changed:
+                # Generate new filename. The file's own name counts as free,
+                # so an update that doesn't change the name keeps it (no `_2`).
+                new_filename, author_names = generate_new_filename(
+                    final_author,
+                    final_title,
+                    self.processed_files,
+                    config.REFERENCE_DIR,
+                    current_filename=filename,
+                )
+                final_year_clean = (
+                    final_year if final_year not in ["n.d.", ""] else None
+                )
+                new_values = {
                     "author": ", ".join(author_names),
                     "year": final_year_clean or "",
                     "title": final_title,
-                    "publisher": current_publisher or "",
+                    "publisher": final_publisher or "",
                     "filename": new_filename,
                 }
-            )
+            else:
+                # Publisher-only: it isn't part of the filename, so nothing
+                # else is regenerated -- only the publisher changes.
+                new_filename = filename
+                new_values = {
+                    "author": current_author,
+                    "year": current_year,
+                    "title": current_title,
+                    "publisher": final_publisher,
+                    "filename": filename,
+                }
 
-            self.processed_files.add(new_filename)
+            # Journal before touching the file -- also for a metadata-only
+            # update (old_filename == filename), so the history always holds
+            # the prior -> new metadata. No journal, no rename.
+            renaming = filename != new_filename
+            new_path = config.REFERENCE_DIR / new_filename
+            try:
+                journalled_move(
+                    "rename",
+                    (lambda: rename_file(old_path, new_path)) if renaming else noop,
+                    failed_event="rename_failed",
+                    on_journal_failure=lambda e: self._record_error(
+                        "output", filename, f"Failed to write history: {e}", fatal=True
+                    ),
+                    old_filename=filename,
+                    filename=new_filename,
+                    file_hash=current_entry.get("file_hash"),
+                    original_filename=current_entry.get("original_filename"),
+                    author=new_values["author"],
+                    title=new_values["title"],
+                    year=new_values["year"],
+                    publisher=new_values["publisher"],
+                    previous={
+                        "author": current_author,
+                        "title": current_title,
+                        "year": current_year,
+                        "publisher": current_publisher,
+                    },
+                )
+            except HistoryWriteError as e:
+                print(f"    [!] Error writing history, file not renamed: {e}")
+                self._record_error(
+                    "update",
+                    filename,
+                    f"Failed to write history, file not renamed: {e}",
+                    fatal=True,
+                )
+                continue
+            except Exception as e:
+                print(f"    [!] Error renaming file: {e}")
+                self._record_error(
+                    "update", filename, f"Error renaming: {e}", fatal=True
+                )
+                continue
+
+            current_entry.update(new_values)
             self.updated += 1
-
-    @staticmethod
-    def _describe(err: StepError) -> str:
-        """One-line rendering of an error, including which phase it came from."""
-        where = f"{err.phase}/{err.filename}" if err.filename else err.phase
-        return f"[{where}] {err.message}"
+            self.processed_files.add(new_filename)
+            if filename != new_filename:
+                print(f"    ✓ Renamed to: {new_filename}")
+            else:
+                print("    ✓ Metadata updated (filename unchanged)")
 
     def _print_summary(self, total: int) -> None:
         """Print summary to stdout."""
@@ -391,6 +579,12 @@ class UpdateStep(ABC):
             f.write(f"- **Failures**: {len(self.fatal_errors)}\n")
             f.write(f"- **Skipped**: {len(self.skipped_errors)}\n\n")
 
+            if self.interrupted:
+                f.write(
+                    "**Run interrupted**: annotations after the last one "
+                    "listed below were not applied.\n\n"
+                )
+
             if self.quarantined > 0:
                 f.write("## Quarantined Files\n\n")
                 for entry in quarantine_entries:
@@ -409,6 +603,10 @@ class UpdateStep(ABC):
                             changes.append(f"title → {entry['suggested_title']}")
                         if entry.get("suggested_year"):
                             changes.append(f"year → {entry['suggested_year']}")
+                        # "" is a real change here (it clears the publisher)
+                        publisher = entry.get("suggested_publisher")
+                        if publisher is not None:
+                            changes.append(f"publisher → {publisher or '(cleared)'}")
                         if changes:
                             entry_name = entry["filename"]
                             change_list = ", ".join(changes)

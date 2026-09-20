@@ -2,6 +2,7 @@
 """Unit tests for utils.py"""
 
 import json
+import unicodedata
 import pytest
 from pathlib import Path
 
@@ -20,12 +21,17 @@ from src.lib.utils import (  # noqa: E402
     rename_file,
     title_similarity,
     normalize_author_for_comparison,
+    normalize_text,
     calculate_file_hash,
     is_unknown_author,
+    is_junk_metadata,
+    looks_like_pdf_software,
     is_suspect_filename,
     check_hash_conflict,
     check_filename_conflict,
     create_reference_stub,
+    add_annotation_fields,
+    flatten_files_from_pairs,
     PREPOSITIONS,
     DOMAIN_ADJECTIVES,
 )
@@ -156,6 +162,15 @@ class TestParseAuthor:
         if len(names) > 1:
             assert names[1] in ["Hinton", "Hinton, et al"]
 
+    def test_nfd_input_normalised_to_nfc_surname(self):
+        """A macOS-decomposed (NFD) author name must still yield an
+        accented surname in precomposed (NFC) form, not a mangled one."""
+        nfd_author = unicodedata.normalize("NFD", "Gödel")
+        filename_part, names = parse_author(nfd_author)
+        assert filename_part == "Gödel"
+        assert unicodedata.is_normalized("NFC", filename_part)
+        assert names == ["Gödel"]
+
 
 # =============================================================================
 # Tests for sanitize_title()
@@ -236,6 +251,37 @@ class TestSanitizeTitle:
         assert "Statistical" in result
         assert "Learning" in result
         assert "Regression" in result
+
+    def test_nfd_input_keeps_accented_letters_in_nfc(self):
+        """A macOS-decomposed (NFD) title must not lose accented letters.
+        Without NFC normalisation, the combining mark left over from
+        decomposition isn't a `\\w` character, so the character filter
+        strips it and corrupts the accented letter (e.g. "Über" -> "ber")."""
+        nfd_title = unicodedata.normalize("NFD", "Über formal unentscheidbare Sätze")
+        result = sanitize_title(nfd_title)
+        assert result == "Über_formal_unentscheidbare_Sätze"
+        assert unicodedata.is_normalized("NFC", result)
+
+
+# =============================================================================
+# Tests for normalize_text()
+# =============================================================================
+
+
+class TestNormalizeText:
+    """Tests for normalize_text() function."""
+
+    def test_nfd_normalised_to_nfc(self):
+        nfd = unicodedata.normalize("NFD", "Über")
+        result = normalize_text(nfd)
+        assert result == "Über"
+        assert unicodedata.is_normalized("NFC", result)
+
+    def test_none_passthrough(self):
+        assert normalize_text(None) is None
+
+    def test_empty_string_passthrough(self):
+        assert normalize_text("") == ""
 
 
 # =============================================================================
@@ -324,6 +370,35 @@ class TestCheckDuplicateFilename:
         (tmp_path / "Smith_Test.pdf").touch()
         result = check_duplicate_filename("Smith_Test.pdf", set(), target_dir=tmp_path)
         assert result == "Smith_Test_2.pdf"
+
+    def test_own_current_name_is_free(self, tmp_path):
+        """Renaming a file to its own name keeps it, not `_2`."""
+        (tmp_path / "Smith_Test.pdf").touch()
+        result = check_duplicate_filename(
+            "Smith_Test.pdf", set(), tmp_path, current_filename="Smith_Test.pdf"
+        )
+        assert result == "Smith_Test.pdf"
+
+    def test_suffixed_current_name_is_kept_not_shuffled(self, tmp_path):
+        """`X_2.pdf` whose base `X.pdf` belongs to another file stays `X_2`."""
+        (tmp_path / "Smith_Test.pdf").touch()
+        (tmp_path / "Smith_Test_2.pdf").touch()
+        result = check_duplicate_filename(
+            "Smith_Test.pdf", set(), tmp_path, current_filename="Smith_Test_2.pdf"
+        )
+        assert result == "Smith_Test_2.pdf"
+
+    def test_other_files_still_taken_with_current_name(self, tmp_path):
+        """A different file's name on disk, or a name reserved this run,
+        is never handed out just because current_filename is set."""
+        (tmp_path / "Smith_Test.pdf").touch()
+        result = check_duplicate_filename(
+            "Smith_Test.pdf",
+            {"Smith_Test_2.pdf"},
+            tmp_path,
+            current_filename="Jones_Other.pdf",
+        )
+        assert result == "Smith_Test_3.pdf"
 
 
 # =============================================================================
@@ -498,6 +573,35 @@ class TestConstants:
         assert expected.issubset(DOMAIN_ADJECTIVES)
 
 
+class TestAnnotationFields:
+    """suggested_publisher is a first-class annotation field."""
+
+    def test_add_annotation_fields_includes_publisher(self):
+        entries = [{"filename": "A.pdf"}, {"filename": "B.pdf", "quarantine": True}]
+        add_annotation_fields(entries)
+        assert entries[0]["suggested_publisher"] is None
+        assert entries[1]["quarantine"] is True
+        assert entries[1]["suggested_publisher"] is None
+
+    def test_flatten_merges_publisher_and_empty_string_wins(self):
+        """Non-null wins when merging a file seen in two pairs -- including
+        "" (a request to clear the publisher)."""
+        pairs = [
+            {
+                "file1": {"filename": "A.pdf", "suggested_publisher": None},
+                "file2": {"filename": "B.pdf", "suggested_publisher": "Press"},
+            },
+            {
+                "file1": {"filename": "A.pdf", "suggested_publisher": ""},
+                "file2": {"filename": "C.pdf", "suggested_publisher": None},
+            },
+        ]
+        by_name = {f["filename"]: f for f in flatten_files_from_pairs(pairs)}
+        assert by_name["A.pdf"]["suggested_publisher"] == ""
+        assert by_name["B.pdf"]["suggested_publisher"] == "Press"
+        assert by_name["C.pdf"]["suggested_publisher"] is None
+
+
 # =============================================================================
 # Tests for title_similarity()
 # =============================================================================
@@ -667,6 +771,154 @@ class TestIsUnknownAuthor:
 
 
 # =============================================================================
+# Tests for is_junk_metadata()
+# =============================================================================
+
+
+class TestIsJunkMetadata:
+    """Tests for is_junk_metadata() function."""
+
+    def test_blank_title_is_junk(self):
+        assert is_junk_metadata("title", "") is True
+        assert is_junk_metadata("title", "   ") is True
+        assert is_junk_metadata("title", None) is True
+
+    def test_microsoft_word_prefix_is_junk(self):
+        assert is_junk_metadata("title", "Microsoft Word - draft3.doc") is True
+
+    def test_microsoft_powerpoint_prefix_is_junk(self):
+        assert is_junk_metadata("title", "Microsoft PowerPoint - slides.pptx") is True
+
+    def test_microsoft_prefix_case_insensitive(self):
+        assert is_junk_metadata("title", "microsoft word - notes.doc") is True
+
+    def test_title_ending_in_software_extension_is_junk(self):
+        for ext in ("doc", "docx", "tex", "dvi", "pdf", "ps"):
+            assert is_junk_metadata("title", f"some_file.{ext}") is True
+
+    def test_untitled_is_junk(self):
+        assert is_junk_metadata("title", "Untitled") is True
+        assert is_junk_metadata("title", "untitled document") is True
+
+    def test_real_title_is_not_junk(self):
+        assert is_junk_metadata("title", "Elements of Statistical Learning") is False
+
+    def test_blank_author_is_junk(self):
+        assert is_junk_metadata("author", "") is True
+        assert is_junk_metadata("author", None) is True
+
+    def test_generic_author_values_are_junk(self):
+        for value in (
+            "Administrator",
+            "admin",
+            "User",
+            "OWNER",
+            "unknown",
+            "Author",
+        ):
+            assert is_junk_metadata("author", value) is True
+
+    def test_real_author_is_not_junk(self):
+        assert is_junk_metadata("author", "Jane Doe") is False
+
+
+# =============================================================================
+# Tests for looks_like_pdf_software()
+# =============================================================================
+
+
+class TestLooksLikePdfSoftware:
+    """Tests for looks_like_pdf_software() function."""
+
+    @pytest.mark.parametrize(
+        "value",
+        [
+            "pdfTeX-1.40.21",
+            "LaTeX with hyperref package",
+            "TeX output 2021.01.01:1234",
+            "dvips(k) 5.998",
+            "dvipdf(k)",
+            "xdvipdfmx (20200315)",
+            "GPL Ghostscript 9.55.0",
+            "Adobe Acrobat Pro DC",
+            "Adobe PDF Library 4.16",
+            "Acrobat Distiller 4.16",
+            "Microsoft: Print To PDF",
+            "Microsoft Word",
+            "Quartz PDFContext",
+            "macOS Version 13.4.1 (Build 22F82)",
+            "Mac OS X 10.6.8 Quartz PDFContext",
+            "Skia/PDF m108",
+            "PDFium",
+            "iText 5.5.13.1",
+            "pypdf",
+            "PyPDF2",
+            "ReportLab PDF Library - www.reportlab.com",
+            "cairo 1.16.0 (https://cairographics.org)",
+            "LibreOffice 7.3",
+            "OpenOffice.org 3.4",
+            "Prince 14.2",
+            "wkhtmltopdf 0.12.6",
+            "PScript5.dll Version 5.2.2",
+            "Nitro PDF Creator",
+            "ABBYY FineReader 12",
+            "ScanSoft PDF Create!",
+            "Canon MF Scan Utility",
+            "Xerox WorkCentre 7845",
+            "PDF 1.4",
+        ],
+    )
+    def test_flags_pdf_producing_software(self, value):
+        assert looks_like_pdf_software(value) is True
+
+    @pytest.mark.parametrize(
+        "value",
+        [
+            "Springer",
+            "MIT Press",
+            "O'Reilly",
+            "Cambridge University Press",
+            "Elsevier",
+            "Wiley",
+            "Microsoft Press",
+            # Words that name PDF software but also real publishers and
+            # institutions: a bare word match would clear a correct
+            # publisher, and update-mismatches applies "" unattended.
+            "The American University in Cairo Press",
+            "Xerox PARC",
+            "Microsoft Research",
+            "Nitro Publishing",
+            "Canongate Books",
+            "Prince Editions",
+        ],
+    )
+    def test_does_not_flag_plausible_publishers(self, value):
+        assert looks_like_pdf_software(value) is False
+
+    @pytest.mark.parametrize(
+        "value",
+        [
+            "Xerox WorkCentre 7845",
+            "Canon MF Scan Utility",
+            "Microsoft: Print To PDF",
+            "Microsoft Word",
+            "Nitro PDF Creator",
+            "Prince 14.2 (www.princexml.com)",
+            "cairo 1.16.0 (https://cairographics.org)",
+        ],
+    )
+    def test_flags_ambiguous_words_with_producer_context(self, value):
+        """The same words still count as software when the rest of the
+        value is producer-shaped: a version number or a device/app word."""
+        assert looks_like_pdf_software(value) is True
+
+    def test_blank_or_missing_is_not_flagged(self):
+        assert looks_like_pdf_software("") is False
+        assert looks_like_pdf_software(None) is False
+        assert looks_like_pdf_software("   ") is False
+
+
+# =============================================================================
 # Tests for is_suspect_filename()
 # =============================================================================
 
@@ -759,6 +1011,64 @@ class TestReferencesJsonOperations:
         content = json.loads(setup_json_env.read_text())
         assert len(content) == 1
         assert content[0]["filename"] == "test.pdf"
+
+    def test_save_references_json_keeps_backup(self, setup_json_env):
+        """Each save copies the previous file to references.json.bak."""
+        from src.lib.utils import save_references_json
+
+        save_references_json([{"filename": "first.pdf"}])
+        save_references_json([{"filename": "second.pdf"}])
+
+        backup = setup_json_env.with_name("references.json.bak")
+        assert json.loads(backup.read_text())[0]["filename"] == "first.pdf"
+        assert json.loads(setup_json_env.read_text())[0]["filename"] == "second.pdf"
+
+    def test_save_references_json_without_backup(self, setup_json_env):
+        """backup=False leaves an existing .bak untouched."""
+        from src.lib.utils import save_references_json
+
+        save_references_json([{"filename": "first.pdf"}])
+        save_references_json([{"filename": "second.pdf"}])
+        save_references_json([{"filename": "third.pdf"}], backup=False)
+
+        backup = setup_json_env.with_name("references.json.bak")
+        assert json.loads(backup.read_text())[0]["filename"] == "first.pdf"
+
+    def test_save_references_json_failure_leaves_original_intact(self, setup_json_env):
+        """A save that fails mid-serialisation must leave references.json
+        byte-identical, with no temp file behind and no .bak written."""
+        from src.lib.utils import save_references_json
+
+        save_references_json([{"filename": "keep.pdf"}])
+        before = setup_json_env.read_bytes()
+        setup_json_env.with_name("references.json.bak").unlink()
+
+        with pytest.raises(TypeError):
+            save_references_json([{"filename": "bad.pdf", "oops": object()}])
+
+        assert setup_json_env.read_bytes() == before
+        assert sorted(p.name for p in setup_json_env.parent.iterdir()) == [
+            "references.json"
+        ]
+
+    def test_atomic_write_failure_removes_temp_file(self, tmp_path, monkeypatch):
+        """If the write itself fails after the temp file exists, the temp
+        file is cleaned up and the target is untouched."""
+        import src.lib.utils as utils_module
+
+        target = tmp_path / "out.md"
+        target.write_text("old")
+
+        def boom(fd):
+            raise OSError("simulated fsync failure")
+
+        monkeypatch.setattr(utils_module.os, "fsync", boom)
+
+        with pytest.raises(OSError):
+            utils_module.atomic_write_text(target, "new")
+
+        assert target.read_text() == "old"
+        assert [p.name for p in tmp_path.iterdir()] == ["out.md"]
 
     def test_add_entry_new(self, setup_json_env):
         """Adding new entry creates it in JSON file."""
@@ -1185,3 +1495,79 @@ class TestCreateReferenceStub:
 
         assert stub["filename"].startswith("Unknown_")
         assert stub["author"] == "Unknown"
+
+
+# =============================================================================
+# Tests for the history journal
+# =============================================================================
+
+
+class TestHistoryJournal:
+    """Tests for append_history() / load_history()."""
+
+    @pytest.fixture
+    def history_file(self, tmp_path, monkeypatch):
+        path = tmp_path / "history.jsonl"
+        monkeypatch.setattr(config, "HISTORY_FILE", path)
+        return path
+
+    def test_missing_file_loads_empty(self, history_file):
+        from src.lib.utils import load_history
+
+        assert load_history() == []
+
+    def test_append_and_load_round_trip(self, history_file):
+        from src.lib.utils import append_history, load_history
+
+        append_history("ingest", original_filename="dl.pdf", filename="Doe_A.pdf")
+        append_history("ingest", original_filename="Über.pdf", filename="Roe_B.pdf")
+
+        lines = history_file.read_text(encoding="utf-8").splitlines()
+        assert len(lines) == 2
+        assert "Über" in lines[1], "non-ASCII must be stored unescaped"
+
+        events = load_history()
+        assert [e["filename"] for e in events] == ["Doe_A.pdf", "Roe_B.pdf"]
+        assert events[0]["event"] == "ingest"
+        assert events[0]["original_filename"] == "dl.pdf"
+        # ISO-8601 in UTC
+        assert events[0]["ts"].endswith("+00:00")
+
+    def test_truncated_final_line_is_skipped(self, history_file):
+        """An append interrupted mid-write leaves a partial last line."""
+        from src.lib.utils import append_history, load_history
+
+        append_history("ingest", filename="Doe_A.pdf")
+        with open(history_file, "a", encoding="utf-8") as f:
+            f.write('{"event": "ingest", "filena')
+
+        events = load_history()
+        assert [e["filename"] for e in events] == ["Doe_A.pdf"]
+
+    def test_malformed_middle_line_is_skipped_with_warning(self, history_file, capsys):
+        """A torn fragment ends up mid-file after the next append; the
+        journal must stay readable around it, with the skip reported."""
+        from src.lib.utils import append_history, load_history
+
+        append_history("ingest", filename="Doe_A.pdf")
+        with open(history_file, "a", encoding="utf-8") as f:
+            f.write("not json\n")
+        append_history("ingest", filename="Roe_B.pdf")
+
+        events = load_history()
+        assert [e["filename"] for e in events] == ["Doe_A.pdf", "Roe_B.pdf"]
+        assert "line(s) 2 " in capsys.readouterr().err
+
+    def test_append_after_torn_line_starts_fresh_line(self, history_file):
+        """A new event must not be glued onto a torn fragment -- that would
+        lose the new event as well."""
+        from src.lib.utils import append_history, load_history
+
+        append_history("ingest", filename="Doe_A.pdf")
+        with open(history_file, "a", encoding="utf-8") as f:
+            f.write('{"event": "ing')
+        append_history("ingest", filename="Roe_B.pdf")
+
+        last = history_file.read_text(encoding="utf-8").splitlines()[-1]
+        assert json.loads(last)["filename"] == "Roe_B.pdf"
+        assert [e["filename"] for e in load_history()] == ["Doe_A.pdf", "Roe_B.pdf"]

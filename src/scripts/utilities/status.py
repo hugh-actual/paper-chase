@@ -14,7 +14,12 @@ from datetime import datetime
 from pathlib import Path
 
 from src.lib import config
-from src.lib.utils import load_references_json, flatten_files_from_pairs
+from src.lib.utils import (
+    SUGGESTED_FIELDS,
+    load_json_or_none,
+    load_references_json,
+    flatten_files_from_pairs,
+)
 
 
 def format_timestamp(filepath: Path) -> str:
@@ -37,14 +42,16 @@ def format_timestamp(filepath: Path) -> str:
 
 
 def count_annotated_entries(entries: list[dict]) -> int:
-    """Count entries with at least one non-null suggested_* field."""
+    """Count entries with at least one non-null suggested_* field.
+
+    Checks every field in SUGGESTED_FIELDS (not just author/title/year),
+    so a publisher-only annotation (suggested_publisher: "") still counts
+    as annotated instead of being silently ignored.
+    """
     annotated = 0
     for entry in entries:
-        if (
-            entry.get("suggested_author") is not None
-            or entry.get("suggested_title") is not None
-            or entry.get("suggested_year") is not None
-            or entry.get("quarantine") is True
+        if entry.get("quarantine") is True or any(
+            entry.get(field) is not None for field in SUGGESTED_FIELDS
         ):
             annotated += 1
     return annotated
@@ -139,6 +146,52 @@ def check_duplicate_candidates() -> dict:
     }
 
 
+def check_metadata_mismatches() -> dict:
+    """Check status of metadata_mismatches.json."""
+    filepath = config.JSON_OUTPUT_DIR / "metadata_mismatches.json"
+    entries = load_json_or_none(filepath)
+    if entries is None:
+        return {"exists": False}
+
+    annotated = count_annotated_entries(entries)
+
+    return {
+        "exists": True,
+        "timestamp": format_timestamp(filepath),
+        "total": len(entries),
+        "annotated": annotated,
+    }
+
+
+def check_todo() -> dict:
+    """Count PDFs waiting in todo/, and which of them the last ingest held
+    back (from ingestion_conflicts.json, limited to files still there)."""
+    todo_pdfs = {
+        f.name for f in config.TODO_DIR.glob("*") if f.suffix.lower() == ".pdf"
+    }
+
+    held_duplicates = 0
+    held_other = 0
+    report_file = config.JSON_OUTPUT_DIR / "ingestion_conflicts.json"
+    report = load_json_or_none(report_file)
+    if report is not None:
+        for item in report.get("conflicts", []):
+            if item.get("original_filename") not in todo_pdfs:
+                continue
+            types = {c.get("type") for c in item.get("conflicts", [])}
+            if "hash_duplicate" in types:
+                held_duplicates += 1
+            else:
+                held_other += 1
+
+    return {
+        "todo": len(todo_pdfs),
+        "held_duplicates": held_duplicates,
+        "held_other": held_other,
+        "report_timestamp": format_timestamp(report_file),
+    }
+
+
 def main():
     """Display collection status and recommendations."""
     print("=" * 70)
@@ -150,6 +203,18 @@ def main():
     refs_timestamp = format_timestamp(config.REFERENCES_JSON)
     print(f"\n📚 Collection: {len(references)} entries")
     print(f"   Last modified: {refs_timestamp}")
+
+    todo = check_todo()
+    held = todo["held_duplicates"] + todo["held_other"]
+    print(f"\n📥 todo/: {todo['todo']} PDFs waiting")
+    if held:
+        print(f"   - {held} held by the last ingest ({todo['report_timestamp']})")
+        if todo["held_duplicates"]:
+            print(f"     {todo['held_duplicates']} exact duplicates of existing files")
+        if todo["held_other"]:
+            print(
+                f"     {todo['held_other']} other conflicts (see ingestion_conflicts.json)"
+            )
 
     # Detection files status
     print("\n📊 Detection Results:")
@@ -188,10 +253,33 @@ def main():
     else:
         print("\n   Duplicate Candidates: not generated")
 
+    mismatches = check_metadata_mismatches()
+    if mismatches["exists"]:
+        print(f"\n   Metadata Mismatches ({mismatches['timestamp']}):")
+        print(f"   - {mismatches['total']} entries found")
+        print(f"   - {mismatches['annotated']} entries annotated")
+    else:
+        print("\n   Metadata Mismatches: not generated")
+
     # Recommendations
     print("\n💡 Recommendations:")
 
     recommendations = []
+
+    if todo["todo"] > held:
+        recommendations.append(
+            f"Run 'make ingest' to process {todo['todo'] - held} new PDFs in todo/"
+        )
+    if todo["held_duplicates"]:
+        recommendations.append(
+            f"Run 'make quarantine-held' to review moving {todo['held_duplicates']} "
+            "held duplicates to quarantine/ (APPLY=1 to move)"
+        )
+    if todo["held_other"]:
+        recommendations.append(
+            f"Review {todo['held_other']} held files in "
+            "json-output/ingestion_conflicts.json"
+        )
 
     # Check for unannotated detection results
     if similar["exists"] and similar["total_files"] > 0:
@@ -234,9 +322,25 @@ def main():
         elif duplicates["annotated"] > 0:
             recommendations.append("Run 'make update-dups' to apply annotations")
 
+    if mismatches["exists"] and mismatches["total"] > 0:
+        unannotated = mismatches["total"] - mismatches["annotated"]
+        if unannotated > 0:
+            recommendations.append(
+                f"Annotate {unannotated} entries in metadata_mismatches.json, "
+                f"then run 'make update-mismatches'"
+            )
+        elif mismatches["annotated"] > 0:
+            recommendations.append("Run 'make update-mismatches' to apply annotations")
+
     # Check if no detection has been run
     if not any(
-        [similar["exists"], unknown["exists"], broken["exists"], duplicates["exists"]]
+        [
+            similar["exists"],
+            unknown["exists"],
+            broken["exists"],
+            duplicates["exists"],
+            mismatches["exists"],
+        ]
     ):
         recommendations.append(
             "Run 'make detect-all' to find issues in your collection"

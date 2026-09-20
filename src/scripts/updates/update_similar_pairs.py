@@ -5,8 +5,6 @@ Processes files with quarantine flags or suggested metadata updates.
 Handles file1, file2, and any additional fileN entries.
 """
 
-import json
-
 from src.lib.steps import UpdateStep
 from src.lib.utils import flatten_files_from_pairs
 
@@ -18,11 +16,13 @@ class UpdateSimilarPairs(UpdateStep):
     input_filename = "similar_pairs.json"
     log_filename = "similar_pairs_update_log.md"
     log_title = "Similar Pairs Update Log"
+    detect_command = "detect-dups"
 
     def load_entries(self) -> list[dict]:
         """Load and flatten similar pair entries from similar_pairs.json."""
-        with open(self.input_file, "r", encoding="utf-8") as f:
-            data = json.load(f)
+        data = self._read_input_json()
+        if data is None:
+            return []
 
         similar_pairs = data.get("similar_pairs", [])
         return flatten_files_from_pairs(similar_pairs)

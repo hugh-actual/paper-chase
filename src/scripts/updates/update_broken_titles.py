@@ -7,8 +7,6 @@ Update broken title entries using curated metadata from broken_titles.json
 - Handle quarantine entries
 """
 
-import json
-
 from src.lib.steps import UpdateStep
 
 
@@ -19,12 +17,11 @@ class UpdateBrokenTitles(UpdateStep):
     input_filename = "broken_titles.json"
     log_filename = "broken_titles_update_log.md"
     log_title = "Broken Titles Update Log"
+    detect_command = "find-broken"
 
     def load_entries(self) -> list[dict]:
         """Load broken title entries from broken_titles.json."""
-        with open(self.input_file, "r", encoding="utf-8") as f:
-            entries = json.load(f)
-        return entries
+        return self._read_input_json() or []
 
 
 def main():

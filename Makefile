@@ -1,8 +1,8 @@
 .PHONY: help status ingest detect-all update-all \
         process generate \
-        find-broken find-unknown detect-dups \
-        update-broken update-unknown update-dups update-similar \
-        verify validate \
+        find-broken find-unknown detect-dups find-mismatches \
+        update-broken update-unknown update-dups update-similar update-mismatches \
+        verify validate recover quarantine-held \
         test format lint extract
 
 # Default target
@@ -23,16 +23,20 @@ help:
 	@echo "  make find-broken    Find broken titles"
 	@echo "  make find-unknown   Find unknown authors"
 	@echo "  make detect-dups    Duplicate detection (exact, similar, suffix)"
+	@echo "  make find-mismatches  Find publisher/filename metadata mismatches"
 	@echo ""
 	@echo "Updates (apply annotated JSON changes):"
 	@echo "  make update-broken  Apply broken title fixes"
 	@echo "  make update-unknown Apply unknown author fixes"
 	@echo "  make update-dups    Apply exact duplicate fixes"
 	@echo "  make update-similar Apply similar pair fixes"
+	@echo "  make update-mismatches  Apply metadata mismatch fixes"
 	@echo ""
 	@echo "Verification:"
 	@echo "  make verify         Check files vs metadata consistency"
 	@echo "  make validate       Validate references.json matches references.md"
+	@echo "  make recover        Rebuild entries from history (dry run; APPLY=1 writes)"
+	@echo "  make quarantine-held  Move held duplicates from todo/ to quarantine/ (APPLY=1)"
 	@echo ""
 	@echo "Testing & QA:"
 	@echo "  make test           Run pytest"
@@ -50,11 +54,11 @@ ingest: process verify
 	@echo ""
 	@echo "✓ Ingestion complete"
 
-detect-all: find-broken find-unknown detect-dups
+detect-all: find-broken find-unknown detect-dups find-mismatches
 	@echo ""
 	@echo "✓ All detection complete. Review JSON files in json-output/"
 
-update-all: update-broken update-unknown update-dups update-similar verify
+update-all: update-broken update-unknown update-dups update-similar update-mismatches verify
 	@echo ""
 	@echo "✓ All updates applied and verified"
 
@@ -75,6 +79,9 @@ find-unknown:
 detect-dups:
 	uv run python -m src.scripts.detection.detect_duplicates
 
+find-mismatches:
+	uv run python -m src.scripts.detection.find_metadata_mismatches
+
 # Updates
 update-broken:
 	uv run python -m src.scripts.updates.update_broken_titles
@@ -88,12 +95,21 @@ update-dups:
 update-similar:
 	uv run python -m src.scripts.updates.update_similar_pairs
 
+update-mismatches:
+	uv run python -m src.scripts.updates.update_metadata_mismatches
+
 # Verification
 verify:
 	uv run python -m src.scripts.core.verify_files_and_metadata
 
 validate:
 	uv run python -m src.scripts.utilities.validate_references_json
+
+recover:
+	uv run python -m src.scripts.utilities.recover_orphans $(if $(APPLY),--apply,)
+
+quarantine-held:
+	uv run python -m src.scripts.utilities.quarantine_held $(if $(APPLY),--apply,)
 
 # Testing & QA
 test:

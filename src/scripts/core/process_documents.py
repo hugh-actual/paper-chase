@@ -10,22 +10,28 @@ import re
 import shutil
 from datetime import datetime
 from pathlib import Path
-from typing import Dict
+from typing import Dict, Optional
 from pypdf import PdfReader
 
 # Configuration is accessed as config.<NAME> so tests can redirect
 # paths by patching src.lib.config alone
 from src.lib import config
+from src.lib.steps import ErrorTrackingStep
 
 # Import shared utilities
 from src.lib.utils import (
     build_reference_entry,
+    calculate_file_hash,
     regenerate_references_md,
+    load_history,
     load_references_json,
     save_references_json,
     create_reference_stub,
     check_hash_conflict,
-    check_filename_conflict,
+    atomic_write_text,
+    journalled_move,
+    normalize_text,
+    is_junk_metadata,
 )
 
 # Configuration
@@ -35,18 +41,88 @@ MAX_FILE_SIZE = 50 * 1024 * 1024  # 50MB in bytes
 GENERIC_TERMS = {"introduction", "guide", "handbook", "manual"}
 
 
-class DocumentProcessor:
+def _extract_plausible_year(text: str) -> Optional[str]:
+    """Find the first plausible 4-digit year in text.
+
+    Excludes matches that are part of a longer digit run (so an ISBN like
+    `9780387848570` never yields a year) and matches outside a sane range,
+    so a random 4-digit code isn't mistaken for a year.
+    """
+    current_year = datetime.now().year
+    for match in re.finditer(r"(?<!\d)(\d{4})(?!\d)", text):
+        year = int(match.group(1))
+        if 1500 <= year <= current_year + 1:
+            return match.group(1)
+    return None
+
+
+def choose_metadata(
+    pdf_meta: Dict[str, object], filename_info: Dict[str, object]
+) -> Dict[str, object]:
+    """Decide final author/title/year/publisher from embedded PDF metadata
+    and filename-pattern parsing.
+
+    A structured filename (one that matched a recognised author/title
+    pattern in `extract_from_filename`) is trusted field-by-field over
+    embedded PDF metadata, which is often generic scanner/software junk
+    (`/Title` "Microsoft Word - draft3.doc", `/Author` "Administrator")
+    -- metadata only fills a field the filename left blank. An
+    unstructured filename (arxiv-number or bare-name fallback) instead
+    lets non-junk metadata win, falling back to the filename otherwise.
+
+    `year` and `publisher` are never sourced from PDF metadata (see
+    `extract_pdf_metadata`): year comes from the filename or "n.d.";
+    publisher is left empty.
+    """
+    structured = bool(filename_info.get("structured"))
+
+    def pick(field):
+        meta_value = pdf_meta.get(field)
+        file_value = filename_info.get(field)
+        meta_ok = bool(meta_value) and not is_junk_metadata(field, meta_value)
+        if structured:
+            return file_value if file_value else (meta_value if meta_ok else None)
+        return meta_value if meta_ok else file_value
+
+    return {
+        "author": pick("author"),
+        "title": pick("title"),
+        "year": filename_info.get("year") or "n.d.",
+        "publisher": pdf_meta.get("publisher"),
+    }
+
+
+class DocumentProcessor(ErrorTrackingStep):
     def __init__(self):
         self.processed_files = []
         self.log_entries = []
-        self.skipped_large = []
-        self.skipped_non_pdf = []
-        self.errors = []
         self.conflicts = []  # Track files with hash/filename conflicts
+        self.relinked = []  # Files that restored an entry's missing file
         self.existing_references = None  # Pre-loaded references for conflict checking
+        # History journal, loaded once per run and indexed by hash: without
+        # the index every ingested file re-scans a journal that only grows.
+        self.history = []
+        self._quarantined_by_hash = {}
+        # references.json is saved after every file; only the first save of
+        # the run backs up, so references.json.bak is the pre-run state.
+        self._backed_up = False
+
+        # Failures (an exception while ingesting a file, references.json or
+        # references.md failing to write) make the script exit nonzero;
+        # conflicts and skipped large/non-PDF files are routine and don't.
+        # The bookkeeping itself lives in ErrorTrackingStep.
+        super().__init__()
 
     def extract_pdf_metadata(self, pdf_path: Path) -> Dict[str, str]:
-        """Extract metadata from PDF file."""
+        """Extract metadata from PDF file.
+
+        `year` and `publisher` are never populated from embedded PDF
+        metadata: `/CreationDate`/`/ModDate` record when a file was
+        scanned or saved, not when the work was published, and
+        `/Producer` names the PDF-generating software, not a publisher.
+        Both fields are sourced from the filename instead (see
+        `choose_metadata`).
+        """
         metadata = {"title": None, "author": None, "year": None, "publisher": None}
 
         try:
@@ -55,19 +131,14 @@ class DocumentProcessor:
                 info = pdf_reader.metadata
 
                 if info:
-                    metadata["title"] = info.get("/Title", None)
-                    metadata["author"] = info.get("/Author", None)
-
-                    # Try to extract year from creation or modification date
-                    for date_key in ["/CreationDate", "/ModDate"]:
-                        if date_key in info and info[date_key]:
-                            date_str = str(info[date_key])
-                            year_match = re.search(r"(\d{4})", date_str)
-                            if year_match:
-                                metadata["year"] = year_match.group(1)
-                                break
-
-                    metadata["publisher"] = info.get("/Producer", None)
+                    title = info.get("/Title", None)
+                    author = info.get("/Author", None)
+                    metadata["title"] = (
+                        normalize_text(str(title).strip()) if title else None
+                    )
+                    metadata["author"] = (
+                        normalize_text(str(author).strip()) if author else None
+                    )
         except Exception as e:
             self.log_entries.append(
                 f"Error extracting metadata from {pdf_path.name}: {str(e)}"
@@ -75,9 +146,26 @@ class DocumentProcessor:
 
         return metadata
 
-    def extract_from_filename(self, filename: str) -> Dict[str, str]:
-        """Extract author, title, and year from filename patterns."""
-        info = {"author": None, "title": None, "year": None}
+    def extract_from_filename(self, filename: str) -> Dict[str, object]:
+        """Extract author, title, and year from filename patterns.
+
+        `structured` reports whether the filename matched a recognised
+        author/title(/year) pattern rather than falling back to the
+        arxiv-number or default (whole-name-as-title) parse. It's how
+        `choose_metadata` decides whether a curated filename should
+        outrank embedded PDF metadata field-by-field, or only fill gaps
+        that (non-junk) metadata leaves.
+        """
+        info = {
+            "author": None,
+            "title": None,
+            "year": None,
+            "structured": False,
+            # "pattern" when the filename dedicates a field to the year,
+            # "text" when it was merely found among the title's words (a
+            # title like "Rereading 1984" yields a year that isn't one).
+            "year_source": None,
+        }
 
         # Remove extension
         name = filename.rsplit(".", 1)[0]
@@ -85,38 +173,62 @@ class DocumentProcessor:
         # Pattern 1: [Author]Title
         match = re.match(r"\[([^\]]+)\](.+)", name)
         if match:
-            info["author"] = match.group(1).strip()
-            info["title"] = match.group(2).strip()
+            title = match.group(2).strip()
+            info["author"] = normalize_text(match.group(1).strip())
+            info["title"] = normalize_text(title)
+            year = _extract_plausible_year(title)
+            info["year"] = year
+            info["year_source"] = "text" if year else None
+            info["structured"] = True
             return info
 
-        # Pattern 2: YYYY-Author-Title
+        # Pattern 2: YYYY-Author-Title. The author segment must contain at
+        # least one letter, otherwise a filename like
+        # "2019-2020-Annual-Report" would mint an author of "2020" instead
+        # of falling through to a later pattern/the default branch.
         match = re.match(r"(\d{4})-([^-]+)-(.+)", name)
-        if match:
+        if match and re.search(r"[^\W\d_]", match.group(2)):
             info["year"] = match.group(1)
-            info["author"] = match.group(2).strip()
-            info["title"] = match.group(3).strip()
+            info["year_source"] = "pattern"
+            info["author"] = normalize_text(match.group(2).strip())
+            info["title"] = normalize_text(match.group(3).strip())
+            info["structured"] = True
             return info
 
         # Pattern 3: YYYY_Book_Title or similar
         match = re.match(r"(\d{4})_(?:Book|Article)_(.+)", name)
         if match:
             info["year"] = match.group(1)
-            info["title"] = match.group(2).strip()
+            info["year_source"] = "pattern"
+            info["title"] = normalize_text(match.group(2).strip())
+            info["structured"] = True
             return info
 
-        # Pattern 4: arxiv number + title
+        # Pattern 4: Author et al - Title
+        match = re.match(r"^(.+?\bet al\.?)\s+-\s+(.+)$", name, re.IGNORECASE)
+        if match:
+            title = match.group(2).strip()
+            info["author"] = normalize_text(match.group(1).strip())
+            info["title"] = normalize_text(title)
+            year = _extract_plausible_year(title)
+            info["year"] = year
+            info["year_source"] = "text" if year else None
+            info["structured"] = True
+            return info
+
+        # Pattern 5: arxiv number + title (not "structured": there's no
+        # author or year here, just a title, same as the default branch)
         match = re.match(r"(\d{4}\.\d+)\s*(.+)?", name)
         if match:
-            info["title"] = match.group(2).strip() if match.group(2) else match.group(1)
+            title = match.group(2).strip() if match.group(2) else match.group(1)
+            info["title"] = normalize_text(title)
             return info
 
         # Default: treat whole name as title
-        info["title"] = name
-
-        # Try to extract year from anywhere in filename
-        year_match = re.search(r"(\d{4})", name)
-        if year_match:
-            info["year"] = year_match.group(1)
+        info["title"] = normalize_text(name)
+        year = _extract_plausible_year(name)
+        info["year"] = year
+        info["year_source"] = "text" if year else None
 
         return info
 
@@ -127,13 +239,12 @@ class DocumentProcessor:
             metadata = self.extract_pdf_metadata(file_path)
             filename_info = self.extract_from_filename(file_path.name)
 
-            # Merge information (prefer metadata, fallback to filename)
-            author = metadata.get("author") or filename_info.get("author")
-            title = (
-                metadata.get("title") or filename_info.get("title") or file_path.stem
-            )
-            year = metadata.get("year") or filename_info.get("year") or "n.d."
-            publisher = metadata.get("publisher")
+            # Merge information (see choose_metadata for the precedence rules)
+            chosen = choose_metadata(metadata, filename_info)
+            author = chosen["author"]
+            title = chosen["title"] or file_path.stem
+            year = chosen["year"]
+            publisher = chosen["publisher"]
 
             # Create reference stub with hash and filename before processing.
             # Reserve names against both this batch's processed files and
@@ -152,36 +263,13 @@ class DocumentProcessor:
             )
 
             # Check for conflicts against existing references
-            conflicts_found = []
+            conflicts_found, relink_entry = self._check_conflicts(stub)
 
-            hash_conflict = check_hash_conflict(
-                stub["file_hash"], self.existing_references
-            )
-            if hash_conflict:
-                conflicts_found.append(
-                    {
-                        "type": "hash_duplicate",
-                        "existing_filename": hash_conflict["filename"],
-                        "existing_title": hash_conflict.get("title", ""),
-                        "message": f"File hash matches existing entry: {hash_conflict['filename']}",
-                    }
-                )
-
-            filename_conflict = check_filename_conflict(
-                stub["filename"], self.existing_references
-            )
-            if filename_conflict:
-                conflicts_found.append(
-                    {
-                        "type": "filename_collision",
-                        "existing_filename": filename_conflict["filename"],
-                        "existing_title": filename_conflict.get("title", ""),
-                        "message": (
-                            f"Filename would collide with existing: "
-                            f"{filename_conflict['filename']}"
-                        ),
-                    }
-                )
+            # Hash matches an entry whose file is gone: this *is* that file,
+            # so put it back under the entry's name instead of holding it.
+            if relink_entry is not None:
+                self._relink(file_path, relink_entry)
+                return True
 
             # If conflicts found, skip this file and keep in todo/
             if conflicts_found:
@@ -193,8 +281,8 @@ class DocumentProcessor:
                         "conflicts": conflicts_found,
                     }
                 )
-                self.log_entries.append(
-                    f"CONFLICT: {file_path.name} - {conflicts_found[0]['message']}"
+                self._record_error(
+                    "conflict", file_path.name, conflicts_found[0]["message"]
                 )
                 return False  # Skip this file
 
@@ -206,25 +294,29 @@ class DocumentProcessor:
                     f"Long filename ({len(new_filename)} chars): {file_path.name} -> {new_filename}"
                 )
 
-            # Move file from todo/ to reference/ (changed from copy)
-            dest_path = config.REFERENCE_DIR / new_filename
-            shutil.move(str(file_path), str(dest_path))
-
-            # Append to the in-memory references list (saved once at the end
-            # of run()) so later files in this batch see it immediately via
-            # self.existing_references, closing the within-batch duplicate
-            # window.
-            self.existing_references.append(
-                build_reference_entry(
-                    stub["author_names"],
-                    stub["year"],
-                    stub["title"],
-                    stub["publisher"],
-                    new_filename,
-                    original_filename=file_path.name,
-                    file_hash=stub["file_hash"],
-                )
+            # Build the entry up front and journal it *before* the move: if
+            # the run dies after the move but before references.json is
+            # saved, the history still holds everything needed to rebuild
+            # this entry (original name, new name, hash, metadata).
+            entry = build_reference_entry(
+                stub["author_names"],
+                stub["year"],
+                stub["title"],
+                stub["publisher"],
+                new_filename,
+                original_filename=file_path.name,
+                file_hash=stub["file_hash"],
             )
+            # Move file from todo/ to reference/ (changed from copy).
+            dest_path = config.REFERENCE_DIR / new_filename
+            journalled_move(
+                "ingest", shutil.move, str(file_path), str(dest_path), **entry
+            )
+
+            # Append to the in-memory references list so later files in
+            # this batch see it immediately via self.existing_references,
+            # closing the within-batch duplicate window.
+            self.existing_references.append(entry)
 
             # Record processing
             self.processed_files.append(
@@ -238,20 +330,154 @@ class DocumentProcessor:
                 }
             )
 
-            return True
-
         except Exception as e:
-            self.errors.append(f"Error processing {file_path.name}: {str(e)}")
+            self._record_error("ingest", file_path.name, str(e), fatal=True)
             return False
 
-    def run(self):
-        """Main processing loop."""
+        # Save after every file, not once at the end: an interrupted batch
+        # must not leave moved files with no references.json entry. The file
+        # *is* ingested either way (moved, journalled, in memory for the
+        # final save), so a failure here is recorded but still returns True.
+        self._save_references(file_path.name)
+        return True
+
+    def _check_conflicts(self, stub: dict) -> tuple[list[dict], Optional[dict]]:
+        """Check an incoming file against existing references.
+
+        Returns (conflicts, relink_entry). A hash match is classified by
+        the state of the existing entry's file:
+        - present with the same hash -> `hash_duplicate` (a true duplicate);
+        - missing from reference/ -> relink: the incoming file restores it
+          (returned as relink_entry, no conflict);
+        - name occupied by different content -> `hash_matches_missing_file`
+          (held: restoring it would overwrite that other file).
+        With no live match, a hash that was quarantined before and is still
+        in quarantine/ is held as `previously_quarantined`.
+        """
+        conflicts = []
+
+        hash_match = check_hash_conflict(stub["file_hash"], self.existing_references)
+        if hash_match:
+            existing_path = config.REFERENCE_DIR / hash_match["filename"]
+            if not existing_path.exists():
+                return [], hash_match
+            present = calculate_file_hash(existing_path) == stub["file_hash"]
+            if present:
+                message = f"File hash matches existing entry: {hash_match['filename']}"
+            else:
+                message = (
+                    f"File hash matches entry {hash_match['filename']}, whose file "
+                    "is missing and whose name is taken by different content"
+                )
+            conflicts.append(
+                {
+                    "type": (
+                        "hash_duplicate" if present else "hash_matches_missing_file"
+                    ),
+                    "existing_filename": hash_match["filename"],
+                    "existing_title": hash_match.get("title", ""),
+                    "existing_file_present": present,
+                    "message": message,
+                }
+            )
+
+        elif stub["file_hash"]:
+            conflict = self._check_previously_quarantined(stub["file_hash"])
+            if conflict:
+                conflicts.append(conflict)
+
+        # No filename-collision check: create_reference_stub already
+        # suffixes the name against every existing entry and this batch, so
+        # a colliding name can't reach here.
+
+        return conflicts, None
+
+    def _check_previously_quarantined(self, file_hash: str) -> Optional[dict]:
+        """A file with no live entry that was quarantined before.
+
+        Held as `previously_quarantined` while a quarantined copy with this
+        hash is still in quarantine/ -- re-ingesting it would silently undo
+        a deliberate decision. If every quarantined copy is gone or has
+        changed, there's nothing to protect: ingest it, with a warning.
+        """
+        events = self._quarantined_by_hash.get(file_hash, [])
+        for event in reversed(events):
+            name = event.get("quarantine_filename")
+            if not name:
+                continue
+            quarantined = config.QUARANTINE_DIR / name
+            if quarantined.exists() and calculate_file_hash(quarantined) == file_hash:
+                return {
+                    "type": "previously_quarantined",
+                    "quarantine_filename": name,
+                    "quarantined_at": event.get("ts"),
+                    "existing_filename": name,
+                    "existing_title": event.get("title", ""),
+                    "existing_file_present": True,
+                    "message": (
+                        f"File hash matches a file quarantined on "
+                        f"{event.get('ts')}: quarantine/{name}"
+                    ),
+                }
+
+        if events:
+            latest = events[-1]
+            self.log_entries.append(
+                f"Re-ingesting a file quarantined on {latest.get('ts')} "
+                f"(as quarantine/{latest.get('quarantine_filename')}); that "
+                "quarantined copy is gone or has changed"
+            )
+        return None
+
+    def _relink(self, file_path: Path, entry: dict) -> None:
+        """Move `file_path` to the missing file of `entry`, keeping the
+        entry's metadata. Journalled before the move, like an ingest."""
+        dest_path = config.REFERENCE_DIR / entry["filename"]
+        journalled_move(
+            "relink",
+            shutil.move,
+            str(file_path),
+            str(dest_path),
+            **entry,
+            incoming_filename=file_path.name,
+        )
+        self.relinked.append(
+            {"original_filename": file_path.name, "new_filename": entry["filename"]}
+        )
+        # The entry itself is unchanged, but save as after an ingest so the
+        # run's .bak/atomic-write guarantees cover it too.
+        self._save_references(file_path.name)
+
+    def _save_references(self, filename: str = "") -> bool:
+        """Save references.json, recording a failure as fatal rather than
+        raising (so it can't mask an interrupt already propagating)."""
+        try:
+            save_references_json(self.existing_references, backup=not self._backed_up)
+            self._backed_up = True
+            return True
+        except Exception as e:
+            self._record_error(
+                "output", filename, f"Failed to save references.json: {e}", fatal=True
+            )
+            return False
+
+    def run(self) -> dict:
+        """Main processing loop. Returns a summary dict with counts."""
         print("Starting document processing...")
 
         # Pre-load existing references for conflict checking
         print("Loading existing references...")
         self.existing_references = load_references_json()
         print(f"  Found {len(self.existing_references)} existing entries")
+        # Once per run, for the previously-quarantined check (missing -> [])
+        self.history = load_history()
+        for event in self.history:
+            if event.get("event") in ("quarantine", "quarantine_held") and event.get(
+                "file_hash"
+            ):
+                self._quarantined_by_hash.setdefault(event["file_hash"], []).append(
+                    event
+                )
 
         # Scan files (sorted for deterministic ingest order: when two files
         # would collide on filename, the alphabetically-first one wins the
@@ -274,7 +500,9 @@ class DocumentProcessor:
             size = pdf.stat().st_size
             if size >= MAX_FILE_SIZE:
                 large_pdfs.append(pdf)
-                self.skipped_large.append(f"{pdf.name} ({size / 1024 / 1024:.1f}MB)")
+                self._record_error(
+                    "skip", pdf.name, f"Large PDF ({size / 1024 / 1024:.1f}MB, ≥50MB)"
+                )
             else:
                 small_pdfs.append(pdf)
 
@@ -284,40 +512,163 @@ class DocumentProcessor:
 
         # Record non-PDF files
         for f in non_pdf_files:
-            self.skipped_non_pdf.append(f.name)
+            self._record_error("skip", f.name, "Not a PDF")
 
-        # Process small PDFs
-        for i, pdf_file in enumerate(small_pdfs, 1):
-            print(f"Processing {i}/{len(small_pdfs)}: {pdf_file.name}")
-            self.process_file(pdf_file)
+        # Process small PDFs. Each file saves references.json as it goes;
+        # the finally makes sure an interrupted batch (Ctrl-C is a
+        # BaseException, so no `except Exception` sees it) still gets its
+        # final save and its log before the interrupt propagates.
+        completed = False
+        try:
+            for i, pdf_file in enumerate(small_pdfs, 1):
+                print(f"Processing {i}/{len(small_pdfs)}: {pdf_file.name}")
+                self.process_file(pdf_file)
 
-            # Progress indicator
-            if i % 50 == 0:
-                print(f"  ... {i} files processed")
+                # Progress indicator
+                if i % 50 == 0:
+                    print(f"  ... {i} files processed")
+            completed = True
+        finally:
+            self._finish(completed)
 
-        # Save references.json once, then generate references.md from it
+        return {
+            "processed": len(self.processed_files),
+            "relinked": len(self.relinked),
+            "conflicts": len(self.conflicts),
+            "skipped": len(self.skipped_errors),
+            "fatal_errors": len(self.fatal_errors),
+        }
+
+    def _finish(self, completed: bool) -> None:
+        """Save, regenerate, and log -- on success and on interruption alike."""
+        if not completed:
+            print("\n⚠ Interrupted -- saving progress before exiting...")
+            self.log_entries.append(
+                "Run interrupted: files still in todo/ were not processed"
+            )
+
+        # Final save, then generate references.md from it
         if self.processed_files:
             print("Saving references.json...")
-            save_references_json(self.existing_references)
+            self._save_references()
             print("Generating references.md from JSON...")
-            if regenerate_references_md():
+            try:
+                regenerated = regenerate_references_md()
+            except Exception as e:
+                # Recorded, not raised: it must not mask a propagating interrupt
+                print(f"  [!] Error: {e}")
+                regenerated = False
+            if regenerated:
                 print("  ✓ References.md generated successfully")
             else:
                 print("  ⚠ Warning: generate_references_md.py failed")
+                # references.json now lists files references.md doesn't, and
+                # `verify` never reads references.md -- nothing downstream
+                # would catch this.
+                self._record_error(
+                    "output", "", "Failed to regenerate references.md", fatal=True
+                )
 
-        # Write log
+        # Written in the finally too, so a failure here is recorded rather
+        # than raised -- raising would replace a propagating interrupt.
+        written = set()
+        for write, name in (
+            (self._write_conflict_report, "ingestion_conflicts.json"),
+            (lambda: self._write_log(completed), "log.md"),
+        ):
+            try:
+                write()
+                written.add(name)
+            except Exception as err:
+                print(f"  [!] Error writing {name}: {err}")
+                self._record_error(
+                    "output", "", f"Failed to write {name}: {err}", fatal=True
+                )
+
+        print("\n" + "=" * 70)
+        print("SUMMARY")
+        print("=" * 70)
+        print(f"Processed: {len(self.processed_files)} files")
+        if self.relinked:
+            print(f"Relinked: {len(self.relinked)} missing files restored")
+        print(f"Conflicts: {len(self.conflicts)} files (kept in todo/)")
+        print(f"Failures: {len(self.fatal_errors)}")
+        print(f"Skipped: {len(self.skipped_errors)}")
+
+        if self.fatal_errors:
+            print("\nFailures:")
+            for err in self.fatal_errors:
+                print(f"  - {self._describe(err)}")
+
+        if self.skipped_errors:
+            print("\nSkipped (left in todo/):")
+            for err in self.skipped_errors:
+                print(f"  - {self._describe(err)}")
+
+        if "log.md" in written:
+            print(f"\n✓ Log saved to: {config.MARKDOWN_DIR / 'log.md'}")
+        # Last line on screen, deliberately: the detail above scrolls off, and
+        # a partially-applied run must not end on an unqualified success.
+        if not completed:
+            print("✗ Interrupted -- progress so far is saved; rerun to continue.")
+        elif self.fatal_errors:
+            print(
+                f"✗ {len(self.fatal_errors)} genuine failure(s) "
+                "-- this run did not fully apply."
+            )
+        else:
+            print("✓ Completed with no failures.")
+        print("=" * 70)
+
+    def _write_log(self, completed: bool) -> None:
+        """Write log.md."""
         print("Writing log...")
         with open(config.MARKDOWN_DIR / "log.md", "w", encoding="utf-8") as f:
             f.write("# Document Processing Log\n\n")
+            if not completed:
+                f.write(
+                    "**Interrupted**: this run stopped early. Files still in "
+                    "todo/ were not processed.\n\n"
+                )
             f.write("## Summary\n\n")
             f.write(f"- **Total PDFs processed**: {len(self.processed_files)}\n")
+            f.write(f"- **Missing files restored (relinked)**: {len(self.relinked)}\n")
             f.write(
                 f"- **Conflicts detected (kept in todo/)**: {len(self.conflicts)}\n"
             )
-            f.write(f"- **Large PDFs skipped (≥50MB)**: {len(self.skipped_large)}\n")
-            f.write(f"- **Non-PDF files skipped**: {len(self.skipped_non_pdf)}\n")
-            f.write(f"- **Errors encountered**: {len(self.errors)}\n")
+            f.write(f"- **Skipped (large, non-PDF)**: {len(self._errors_in('skip'))}\n")
+            f.write(f"- **Failures**: {len(self.fatal_errors)}\n")
+            f.write(f"- **Skipped**: {len(self.skipped_errors)}\n")
             f.write(f"- **Issues logged**: {len(self.log_entries)}\n\n")
+
+            if self.processed_files:
+                f.write("## Ingested Files\n\n")
+                for p in self.processed_files:
+                    f.write(f"- {p['original_filename']} → {p['new_filename']}\n")
+                f.write("\n")
+
+            if self.relinked:
+                f.write("## Relinked Files\n\n")
+                f.write(
+                    "Matched the hash of an entry whose file was missing; "
+                    "restored under the entry's name.\n\n"
+                )
+                for p in self.relinked:
+                    f.write(f"- {p['original_filename']} → {p['new_filename']}\n")
+                f.write("\n")
+
+            if self.fatal_errors:
+                f.write("## Failures\n\n")
+                for err in self.fatal_errors:
+                    f.write(f"- {self._describe(err)}\n")
+                f.write("\n")
+
+            if self.skipped_errors:
+                f.write("## Skipped\n\n")
+                f.write("Left in todo/ -- conflicts, large and non-PDF files.\n\n")
+                for err in self.skipped_errors:
+                    f.write(f"- {self._describe(err)}\n")
+                f.write("\n")
 
             if self.conflicts:
                 f.write("## Files with Conflicts (Kept in todo/)\n\n")
@@ -330,50 +681,40 @@ class DocumentProcessor:
                             f.write(f"  - Existing title: {c['existing_title']}\n")
                     f.write("\n")
 
-            if self.skipped_large:
-                f.write("## Large Files Skipped (≥50MB)\n\n")
-                for item in self.skipped_large:
-                    f.write(f"- {item}\n")
-                f.write("\n")
-
-            if self.skipped_non_pdf:
-                f.write("## Non-PDF Files Skipped\n\n")
-                for item in self.skipped_non_pdf:
-                    f.write(f"- {item}\n")
-                f.write("\n")
-
-            if self.errors:
-                f.write("## Errors\n\n")
-                for error in self.errors:
-                    f.write(f"- {error}\n")
-                f.write("\n")
-
             if self.log_entries:
                 f.write("## Issues and Warnings\n\n")
                 for entry in self.log_entries:
                     f.write(f"- {entry}\n")
                 f.write("\n")
 
-        # Write JSON conflict report if there are conflicts
+    def _write_conflict_report(self) -> None:
+        """Write json-output/ingestion_conflicts.json -- always, so a clean
+        run replaces a previous run's report instead of leaving it stale."""
+        conflict_report = {
+            "generated": datetime.now().isoformat(),
+            "conflicts": self.conflicts,
+        }
+        conflict_file = config.JSON_OUTPUT_DIR / "ingestion_conflicts.json"
+        atomic_write_text(
+            conflict_file, json.dumps(conflict_report, indent=2, ensure_ascii=False)
+        )
         if self.conflicts:
-            conflict_report = {
-                "generated": datetime.now().isoformat(),
-                "conflicts": self.conflicts,
-            }
-            conflict_file = config.JSON_OUTPUT_DIR / "ingestion_conflicts.json"
-            with open(conflict_file, "w", encoding="utf-8") as f:
-                json.dump(conflict_report, f, indent=2, ensure_ascii=False)
             print(f"  Conflict report written to: {conflict_file}")
+            if any(
+                c["type"] == "hash_duplicate"
+                for item in self.conflicts
+                for c in item["conflicts"]
+            ):
+                print(
+                    "  Held duplicates: 'make quarantine-held' previews moving "
+                    "them to quarantine/ (APPLY=1 to move)"
+                )
 
-        print("\n✓ Processing complete!")
-        print(f"  - Processed: {len(self.processed_files)} files")
-        print(f"  - Conflicts: {len(self.conflicts)} files (kept in todo/)")
-        print(f"  - Skipped (large): {len(self.skipped_large)} files")
-        print(f"  - Skipped (non-PDF): {len(self.skipped_non_pdf)} files")
-        print(f"  - Errors: {len(self.errors)}")
-        print(f"  - Issues: {len(self.log_entries)}")
+
+def main():
+    """Main entry point."""
+    return DocumentProcessor.run_as_main()
 
 
 if __name__ == "__main__":
-    processor = DocumentProcessor()
-    processor.run()
+    exit(main())
