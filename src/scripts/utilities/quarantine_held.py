@@ -112,7 +112,23 @@ def run(apply: bool = False) -> int:
                 file_hash=todo_hash,
                 existing_filename=existing_name,
             )
-            shutil.move(str(todo_path), str(config.QUARANTINE_DIR / dest_name))
+            # BaseException so an interrupt landing on the move is journalled
+            # too: without the compensating event the journal would claim a
+            # move that never happened.
+            try:
+                shutil.move(str(todo_path), str(config.QUARANTINE_DIR / dest_name))
+            except BaseException as e:
+                try:
+                    append_history(
+                        "quarantine_held_failed",
+                        original_filename=todo_name,
+                        quarantine_filename=dest_name,
+                        file_hash=todo_hash,
+                        error=str(e) or type(e).__name__,
+                    )
+                except Exception:
+                    pass  # the move failure below is the one that matters
+                raise
         except Exception as e:
             errors.append(StepError("move", todo_name, str(e), True))
             continue

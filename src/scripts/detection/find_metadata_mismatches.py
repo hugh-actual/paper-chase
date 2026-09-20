@@ -20,7 +20,7 @@ import json
 
 from src.lib import config
 from src.lib.utils import (
-    _atomic_write_text,
+    atomic_write_text,
     add_annotation_fields,
     is_junk_metadata,
     is_unknown_author,
@@ -90,7 +90,17 @@ def find_filename_mismatches(entry, filename_info):
     filename_year = filename_info.get("year")
     if filename_year and _norm(entry.get("year", "")) != _norm(filename_year):
         reasons.append("original filename suggests a different year")
-        suggestions["suggested_year"] = filename_year
+        if filename_info.get("year_source") == "pattern":
+            # The filename dedicates a field to the year (YYYY-Author-Title,
+            # YYYY_Book_Title), and a stored year predating the precedence
+            # fix came from /CreationDate -- so the filename's is the
+            # reliable one and is safe to pre-fill.
+            suggestions["suggested_year"] = filename_year
+        else:
+            # Found among the title's words ("Rereading 1984 in the Digital
+            # Age"), which is a number in a title, not necessarily a
+            # publication year. Report it; let a human decide.
+            suggestions["filename_year"] = filename_year
 
     return reasons, suggestions
 
@@ -151,7 +161,7 @@ def find_metadata_mismatches():
     # Read as config.<NAME> at call time (not a module-level constant), so
     # tests that redirect config.JSON_OUTPUT_DIR per-run see it take effect.
     output_json = config.JSON_OUTPUT_DIR / "metadata_mismatches.json"
-    _atomic_write_text(output_json, json.dumps(results, indent=2, ensure_ascii=False))
+    atomic_write_text(output_json, json.dumps(results, indent=2, ensure_ascii=False))
 
     print(f"✓ Saved to: {output_json}")
 

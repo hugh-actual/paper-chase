@@ -1878,6 +1878,13 @@ class TestHeldConflicts:
         assert quarantine_held.main(["--apply"]) == 1
         assert held.exists()
 
+        # The journal must not claim a move that never happened: the
+        # quarantine_held event is written first, so a failed move needs a
+        # compensating event, as the ingest and update paths do.
+        events = [h["event"] for h in utils.load_history()]
+        assert events[-2:] == ["quarantine_held", "quarantine_held_failed"]
+        assert "simulated move failure" in utils.load_history()[-1]["error"]
+
     def test_status_reports_todo_and_held(self, sandbox, capsys):
         from src.scripts.utilities import status
 
@@ -2147,6 +2154,55 @@ class TestFindMetadataMismatches:
             "original filename suggests a different title",
             "original filename suggests a different year",
         }
+
+    def test_year_found_in_title_text_is_reported_but_not_prefilled(self, sandbox):
+        """A 4-digit number inside a title ("Rereading 1984 ...") is not a
+        publication year, but update-mismatches applies suggestions
+        unattended via update-all -- so only a year the filename states
+        outright (YYYY-Author-Title) is pre-filled. A title-derived one is
+        reported in the informational filename_year field instead."""
+        from src.scripts.detection import find_metadata_mismatches
+
+        utils.save_references_json(
+            [
+                self._entry(
+                    author="Jane Smith",
+                    title="Rereading 1984 in the Digital Age",
+                    year="2011",
+                    publisher="",
+                    filename="Smith_Rereading_1984_Digital_Age.pdf",
+                    original_filename=("[Smith]Rereading 1984 in the Digital Age.pdf"),
+                )
+            ]
+        )
+
+        [result] = find_metadata_mismatches.find_metadata_mismatches()
+        assert result["suggested_year"] is None
+        assert result["filename_year"] == "1984"
+        assert "original filename suggests a different year" in result["reasons"]
+
+    def test_year_stated_by_the_filename_pattern_is_prefilled(self, sandbox):
+        """By contrast, a YYYY-Author-Title filename dedicates a field to
+        the year, so it is pre-filled (a stored year from before the
+        precedence fix came from /CreationDate)."""
+        from src.scripts.detection import find_metadata_mismatches
+
+        utils.save_references_json(
+            [
+                self._entry(
+                    author="Jane Smith",
+                    title="Great Findings",
+                    year="2019",
+                    publisher="",
+                    filename="Smith_Great_Findings.pdf",
+                    original_filename="1975-Smith-Great Findings.pdf",
+                )
+            ]
+        )
+
+        [result] = find_metadata_mismatches.find_metadata_mismatches()
+        assert result["suggested_year"] == "1975"
+        assert "filename_year" not in result
 
     def test_non_junk_title_is_reported_but_not_prefilled(self, sandbox):
         """A structured-but-lazy filename ("paper_final_v2") must not

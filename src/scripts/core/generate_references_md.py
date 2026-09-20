@@ -6,7 +6,7 @@ Sorts entries by author surname and creates Harvard-style markdown.
 
 import json
 from src.lib import config
-from src.lib.utils import _atomic_write_text, create_harvard_reference
+from src.lib.utils import atomic_write_text, create_harvard_reference
 
 
 def extract_surname(author_str):
@@ -97,7 +97,7 @@ def generate_markdown():
         lines.append(harvard_ref + "\n\n")
 
     # Write to file (atomically, so an interrupted run never leaves it truncated)
-    _atomic_write_text(config.REFERENCES_FILE, "".join(lines))
+    atomic_write_text(config.REFERENCES_FILE, "".join(lines))
 
     print(f"✓ Generated {config.REFERENCES_FILE}")
     print(f"  {len(sorted_entries)} entries sorted by author surname, then title")

@@ -241,7 +241,7 @@ def load_references_json():
         return json.load(f)
 
 
-def _atomic_write_text(path, text):
+def atomic_write_text(path, text):
     """Replace `path` with `text` so a crash never leaves it truncated.
 
     The text goes to a sibling temp file first (same directory, so the final
@@ -275,9 +275,11 @@ def save_references_json(entries, backup: bool = True):
     """
     text = json.dumps(entries, indent=2, ensure_ascii=False)
     if backup and config.REFERENCES_JSON.exists():
-        backup = config.REFERENCES_JSON.with_name(config.REFERENCES_JSON.name + ".bak")
-        shutil.copy2(config.REFERENCES_JSON, backup)
-    _atomic_write_text(config.REFERENCES_JSON, text)
+        backup_path = config.REFERENCES_JSON.with_name(
+            config.REFERENCES_JSON.name + ".bak"
+        )
+        shutil.copy2(config.REFERENCES_JSON, backup_path)
+    atomic_write_text(config.REFERENCES_JSON, text)
 
 
 def append_history(event, **fields):
@@ -962,9 +964,8 @@ def is_junk_metadata(field: str, value: Optional[str]) -> bool:
 
 
 # Generic markers left by the software that produced a PDF, not by a
-# publisher. Short/common words are wrapped in \b so they don't match
-# inside an unrelated name (e.g. "cairo" the city). Collection-specific
-# publisher quirks don't belong here -- this list is deliberately generic.
+# publisher. Collection-specific publisher quirks don't belong here --
+# this list is deliberately generic.
 _PDF_SOFTWARE_MARKERS = (
     r"pdftex",
     r"\blatex\b",
@@ -976,7 +977,6 @@ _PDF_SOFTWARE_MARKERS = (
     r"acrobat",
     r"adobe pdf library",
     r"distiller",
-    r"microsoft(?!\s+press)",
     r"quartz pdfcontext",
     r"\bmacos\b",
     r"mac os x",
@@ -985,21 +985,44 @@ _PDF_SOFTWARE_MARKERS = (
     r"itext",
     r"pypdf",
     r"reportlab",
-    r"\bcairo\b",
     r"libreoffice",
     r"openoffice",
-    r"\bprince\b",
     r"wkhtmltopdf",
     r"pscript",
-    r"\bnitro\b",
     r"abbyy",
     r"scansoft",
-    r"\bcanon\b",
-    r"\bxerox\b",
 )
 _PDF_SOFTWARE_RE = re.compile("|".join(_PDF_SOFTWARE_MARKERS), re.IGNORECASE)
-# A bare "PDF" followed by a version number, e.g. "PDF 1.4", the way
-# some producers stamp the spec version rather than naming themselves.
+
+# Words that name PDF-producing software *and* real publishers or
+# institutions ("Xerox PARC", "The American University in Cairo Press",
+# "Microsoft Research", "Nitro Publishing"). A bare word match would clear
+# a correct publisher, so these only count alongside producer-shaped
+# context -- a version number or a device/application word -- and never
+# when the value reads like a publisher's name.
+_AMBIGUOUS_SOFTWARE_MARKERS = (
+    r"\bcairo\b",
+    r"\bcanon\b",
+    r"\bmicrosoft\b",
+    r"\bnitro\b",
+    r"\bprince\b",
+    r"\bxerox\b",
+)
+_AMBIGUOUS_SOFTWARE_RE = re.compile(
+    "|".join(_AMBIGUOUS_SOFTWARE_MARKERS), re.IGNORECASE
+)
+_PRODUCER_CONTEXT_RE = re.compile(
+    r"\d|\bpdf\b|print to|distiller|workcentre|imagerunner|primo|"
+    r"\bscan\w*|\bcreator\b|\bwriter\b|\bdriver\b|\bword\b|"
+    r"powerpoint|\bexcel\b|\boffice\b|\bxml\b",
+    re.IGNORECASE,
+)
+_PUBLISHER_HINT_RE = re.compile(
+    r"\bpress\b|\bpublish\w*|\buniversity\b|\bbooks?\b|\bverlag\b|"
+    r"\beditions?\b|\bimprint\b|\bjournals?\b|\bsociety\b|"
+    r"\bassociation\b|\binstitute\b|\bfoundation\b",
+    re.IGNORECASE,
+)
 _PDF_VERSION_RE = re.compile(r"\bpdf\s*[\d.]+", re.IGNORECASE)
 
 
@@ -1015,7 +1038,15 @@ def looks_like_pdf_software(value: Optional[str]) -> bool:
     if not value or not str(value).strip():
         return False
     v = str(value).strip()
-    return bool(_PDF_SOFTWARE_RE.search(v) or _PDF_VERSION_RE.search(v))
+    if _PDF_SOFTWARE_RE.search(v) or _PDF_VERSION_RE.search(v):
+        return True
+    # An ambiguous word only counts as software when the rest of the value
+    # looks like a producer string and not like a publisher's name.
+    return bool(
+        _AMBIGUOUS_SOFTWARE_RE.search(v)
+        and _PRODUCER_CONTEXT_RE.search(v)
+        and not _PUBLISHER_HINT_RE.search(v)
+    )
 
 
 def is_suspect_filename(filename: str) -> bool:

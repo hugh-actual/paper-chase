@@ -29,7 +29,7 @@ from src.lib.utils import (
     save_references_json,
     create_reference_stub,
     check_hash_conflict,
-    _atomic_write_text,
+    atomic_write_text,
     normalize_text,
     is_junk_metadata,
 )
@@ -183,7 +183,16 @@ class DocumentProcessor:
         outrank embedded PDF metadata field-by-field, or only fill gaps
         that (non-junk) metadata leaves.
         """
-        info = {"author": None, "title": None, "year": None, "structured": False}
+        info = {
+            "author": None,
+            "title": None,
+            "year": None,
+            "structured": False,
+            # "pattern" when the filename dedicates a field to the year,
+            # "text" when it was merely found among the title's words (a
+            # title like "Rereading 1984" yields a year that isn't one).
+            "year_source": None,
+        }
 
         # Remove extension
         name = filename.rsplit(".", 1)[0]
@@ -194,7 +203,9 @@ class DocumentProcessor:
             title = match.group(2).strip()
             info["author"] = normalize_text(match.group(1).strip())
             info["title"] = normalize_text(title)
-            info["year"] = _extract_plausible_year(title)
+            year = _extract_plausible_year(title)
+            info["year"] = year
+            info["year_source"] = "text" if year else None
             info["structured"] = True
             return info
 
@@ -205,6 +216,7 @@ class DocumentProcessor:
         match = re.match(r"(\d{4})-([^-]+)-(.+)", name)
         if match and re.search(r"[^\W\d_]", match.group(2)):
             info["year"] = match.group(1)
+            info["year_source"] = "pattern"
             info["author"] = normalize_text(match.group(2).strip())
             info["title"] = normalize_text(match.group(3).strip())
             info["structured"] = True
@@ -214,6 +226,7 @@ class DocumentProcessor:
         match = re.match(r"(\d{4})_(?:Book|Article)_(.+)", name)
         if match:
             info["year"] = match.group(1)
+            info["year_source"] = "pattern"
             info["title"] = normalize_text(match.group(2).strip())
             info["structured"] = True
             return info
@@ -224,7 +237,9 @@ class DocumentProcessor:
             title = match.group(2).strip()
             info["author"] = normalize_text(match.group(1).strip())
             info["title"] = normalize_text(title)
-            info["year"] = _extract_plausible_year(title)
+            year = _extract_plausible_year(title)
+            info["year"] = year
+            info["year_source"] = "text" if year else None
             info["structured"] = True
             return info
 
@@ -238,7 +253,9 @@ class DocumentProcessor:
 
         # Default: treat whole name as title
         info["title"] = normalize_text(name)
-        info["year"] = _extract_plausible_year(name)
+        year = _extract_plausible_year(name)
+        info["year"] = year
+        info["year_source"] = "text" if year else None
 
         return info
 
@@ -721,7 +738,7 @@ class DocumentProcessor:
             "conflicts": self.conflicts,
         }
         conflict_file = config.JSON_OUTPUT_DIR / "ingestion_conflicts.json"
-        _atomic_write_text(
+        atomic_write_text(
             conflict_file, json.dumps(conflict_report, indent=2, ensure_ascii=False)
         )
         if self.conflicts:

@@ -881,10 +881,36 @@ class TestLooksLikePdfSoftware:
             "Elsevier",
             "Wiley",
             "Microsoft Press",
+            # Words that name PDF software but also real publishers and
+            # institutions: a bare word match would clear a correct
+            # publisher, and update-mismatches applies "" unattended.
+            "The American University in Cairo Press",
+            "Xerox PARC",
+            "Microsoft Research",
+            "Nitro Publishing",
+            "Canongate Books",
+            "Prince Editions",
         ],
     )
     def test_does_not_flag_plausible_publishers(self, value):
         assert looks_like_pdf_software(value) is False
+
+    @pytest.mark.parametrize(
+        "value",
+        [
+            "Xerox WorkCentre 7845",
+            "Canon MF Scan Utility",
+            "Microsoft: Print To PDF",
+            "Microsoft Word",
+            "Nitro PDF Creator",
+            "Prince 14.2 (www.princexml.com)",
+            "cairo 1.16.0 (https://cairographics.org)",
+        ],
+    )
+    def test_flags_ambiguous_words_with_producer_context(self, value):
+        """The same words still count as software when the rest of the
+        value is producer-shaped: a version number or a device/app word."""
+        assert looks_like_pdf_software(value) is True
 
     def test_blank_or_missing_is_not_flagged(self):
         assert looks_like_pdf_software("") is False
@@ -1039,7 +1065,7 @@ class TestReferencesJsonOperations:
         monkeypatch.setattr(utils_module.os, "fsync", boom)
 
         with pytest.raises(OSError):
-            utils_module._atomic_write_text(target, "new")
+            utils_module.atomic_write_text(target, "new")
 
         assert target.read_text() == "old"
         assert [p.name for p in tmp_path.iterdir()] == ["out.md"]
