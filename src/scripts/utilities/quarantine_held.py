@@ -19,12 +19,16 @@ Dry run by default; `--apply` (`make quarantine-held APPLY=1`) moves.
 """
 
 import argparse
-import json
 import shutil
 
 from src.lib import config
-from src.lib.steps import StepError
-from src.lib.utils import append_history, calculate_file_hash, check_duplicate_filename
+from src.lib.steps import ErrorTrackingStep, StepError
+from src.lib.utils import (
+    calculate_file_hash,
+    check_duplicate_filename,
+    journalled_move,
+    load_json_or_none,
+)
 
 REPORT_FILENAME = "ingestion_conflicts.json"
 
@@ -32,11 +36,9 @@ REPORT_FILENAME = "ingestion_conflicts.json"
 def load_held_duplicates() -> list[tuple[str, str]]:
     """(todo filename, existing reference filename) for every held
     `hash_duplicate` in the last ingest's conflict report."""
-    report_file = config.JSON_OUTPUT_DIR / REPORT_FILENAME
-    if not report_file.exists():
+    report = load_json_or_none(config.JSON_OUTPUT_DIR / REPORT_FILENAME)
+    if report is None:
         return []
-    with open(report_file, "r", encoding="utf-8") as f:
-        report = json.load(f)
 
     held = []
     for item in report.get("conflicts", []):
@@ -105,30 +107,16 @@ def run(apply: bool = False) -> int:
             continue
 
         try:
-            append_history(
+            journalled_move(
                 "quarantine_held",
+                shutil.move,
+                str(todo_path),
+                str(config.QUARANTINE_DIR / dest_name),
                 original_filename=todo_name,
                 quarantine_filename=dest_name,
                 file_hash=todo_hash,
                 existing_filename=existing_name,
             )
-            # BaseException so an interrupt landing on the move is journalled
-            # too: without the compensating event the journal would claim a
-            # move that never happened.
-            try:
-                shutil.move(str(todo_path), str(config.QUARANTINE_DIR / dest_name))
-            except BaseException as e:
-                try:
-                    append_history(
-                        "quarantine_held_failed",
-                        original_filename=todo_name,
-                        quarantine_filename=dest_name,
-                        file_hash=todo_hash,
-                        error=str(e) or type(e).__name__,
-                    )
-                except Exception:
-                    pass  # the move failure below is the one that matters
-                raise
         except Exception as e:
             errors.append(StepError("move", todo_name, str(e), True))
             continue
@@ -141,7 +129,7 @@ def run(apply: bool = False) -> int:
         if group:
             print(f"\n{label}:")
             for err in group:
-                print(f"  - [{err.phase}/{err.filename}] {err.message}")
+                print(f"  - {ErrorTrackingStep._describe(err)}")
 
     print()
     if not apply and moved:

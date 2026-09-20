@@ -316,6 +316,67 @@ def append_history(event, **fields):
         os.fsync(f.fileno())
 
 
+def noop(*_args, **_kwargs):
+    """Do nothing -- the "move" for a journalled change that only rewrites
+    metadata, so it still goes through journalled_move."""
+
+
+class HistoryWriteError(Exception):
+    """The journal entry for a move could not be written, so the move was
+    not attempted. Distinct from a failure of the move itself, which
+    callers report differently."""
+
+
+def journalled_move(event, move, *move_args, failed_event=None, **fields):
+    """Journal `event`, then perform `move` -- the order this whole
+    pipeline depends on.
+
+    The journal entry is written first, so a crash between the two leaves
+    a record of what was *meant* to happen (which `make recover` can act
+    on); if the move then raises -- including on Ctrl-C, hence
+    BaseException -- a compensating `<event>_failed` entry is written
+    before the exception propagates, so the journal never claims a move
+    that did not happen.
+
+    A failure of the *first* write propagates to the caller, which must
+    not then move the file. A failure of the compensating write is
+    reported through `on_journal_failure` (if given) rather than raised,
+    because the move failure already propagating is the more important
+    one.
+    """
+    on_journal_failure = fields.pop("on_journal_failure", None)
+    try:
+        append_history(event, **fields)
+    except Exception as e:
+        raise HistoryWriteError(str(e)) from e
+    try:
+        move(*move_args)
+    except BaseException as e:
+        try:
+            append_history(
+                failed_event or f"{event}_failed",
+                **fields,
+                error=str(e) or type(e).__name__,
+            )
+        except Exception as journal_error:  # pragma: no cover - rare
+            if on_journal_failure is not None:
+                on_journal_failure(journal_error)
+        raise
+
+
+def load_json_or_none(path):
+    """Parse a JSON file, or None when it doesn't exist yet.
+
+    Detection output is optional by design: a step whose detection script
+    has never run is a routine "nothing to do", not a crash.
+    """
+    path = Path(path)
+    if not path.exists():
+        return None
+    with open(path, "r", encoding="utf-8") as f:
+        return json.load(f)
+
+
 def load_history():
     """Load every event from the history journal, oldest first.
 

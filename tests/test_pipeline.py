@@ -406,7 +406,9 @@ class TestUpdateStepJournal:
         def boom(event, **fields):
             raise OSError("simulated history failure")
 
-        monkeypatch.setattr("src.lib.steps.append_history", boom)
+        # Patched in utils: both the direct calls and journalled_move's
+        # go through it.
+        monkeypatch.setattr("src.lib.utils.append_history", boom)
 
         result = SimpleStep().run()
 

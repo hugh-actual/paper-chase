@@ -16,11 +16,10 @@ from pypdf import PdfReader
 # Configuration is accessed as config.<NAME> so tests can redirect
 # paths by patching src.lib.config alone
 from src.lib import config
-from src.lib.steps import StepError
+from src.lib.steps import ErrorTrackingStep
 
 # Import shared utilities
 from src.lib.utils import (
-    append_history,
     build_reference_entry,
     calculate_file_hash,
     regenerate_references_md,
@@ -30,6 +29,7 @@ from src.lib.utils import (
     create_reference_stub,
     check_hash_conflict,
     atomic_write_text,
+    journalled_move,
     normalize_text,
     is_junk_metadata,
 )
@@ -92,53 +92,26 @@ def choose_metadata(
     }
 
 
-class DocumentProcessor:
+class DocumentProcessor(ErrorTrackingStep):
     def __init__(self):
         self.processed_files = []
         self.log_entries = []
-        self.skipped_large = []
-        self.skipped_non_pdf = []
         self.conflicts = []  # Track files with hash/filename conflicts
         self.relinked = []  # Files that restored an entry's missing file
         self.existing_references = None  # Pre-loaded references for conflict checking
-        self.history = []  # History journal, loaded once per run
+        # History journal, loaded once per run and indexed by hash: without
+        # the index every ingested file re-scans a journal that only grows.
+        self.history = []
+        self._quarantined_by_hash = {}
         # references.json is saved after every file; only the first save of
         # the run backs up, so references.json.bak is the pre-run state.
         self._backed_up = False
 
-        # Single record of everything that went wrong, with the same
-        # fatal/routine split as UpdateStep: a fatal error (an exception
-        # while ingesting a file, references.json or references.md failing
-        # to write) makes the script exit nonzero; conflicts and skipped
-        # large/non-PDF files are routine and don't.
-        self.errors: list[StepError] = []
-
-    def _record_error(
-        self, phase: str, filename: str, message: str, fatal: bool = False
-    ) -> None:
-        """Record a failure or a skip. See StepError for the distinction."""
-        self.errors.append(StepError(phase, filename, message, fatal))
-
-    @property
-    def fatal_errors(self) -> list[StepError]:
-        return [e for e in self.errors if e.fatal]
-
-    @property
-    def skipped_errors(self) -> list[StepError]:
-        return [e for e in self.errors if not e.fatal]
-
-    @classmethod
-    def run_as_main(cls) -> int:
-        """Entry point for `python -m`: nonzero only on genuine failures,
-        so `make ingest` stops before `verify` prints a misleading
-        all-clear. Conflicts and skipped files still exit 0."""
-        return 1 if cls().run()["fatal_errors"] else 0
-
-    @staticmethod
-    def _describe(err: StepError) -> str:
-        """One-line rendering of an error, including which phase it came from."""
-        where = f"{err.phase}/{err.filename}" if err.filename else err.phase
-        return f"[{where}] {err.message}"
+        # Failures (an exception while ingesting a file, references.json or
+        # references.md failing to write) make the script exit nonzero;
+        # conflicts and skipped large/non-PDF files are routine and don't.
+        # The bookkeeping itself lives in ErrorTrackingStep.
+        super().__init__()
 
     def extract_pdf_metadata(self, pdf_path: Path) -> Dict[str, str]:
         """Extract metadata from PDF file.
@@ -334,22 +307,11 @@ class DocumentProcessor:
                 original_filename=file_path.name,
                 file_hash=stub["file_hash"],
             )
-            append_history("ingest", **entry)
-
             # Move file from todo/ to reference/ (changed from copy).
-            # BaseException so a Ctrl-C landing on the move is journalled too.
             dest_path = config.REFERENCE_DIR / new_filename
-            try:
-                shutil.move(str(file_path), str(dest_path))
-            except BaseException as e:
-                append_history(
-                    "ingest_failed",
-                    original_filename=file_path.name,
-                    filename=new_filename,
-                    file_hash=stub["file_hash"],
-                    error=str(e) or type(e).__name__,
-                )
-                raise
+            journalled_move(
+                "ingest", shutil.move, str(file_path), str(dest_path), **entry
+            )
 
             # Append to the in-memory references list so later files in
             # this batch see it immediately via self.existing_references,
@@ -438,12 +400,7 @@ class DocumentProcessor:
         a deliberate decision. If every quarantined copy is gone or has
         changed, there's nothing to protect: ingest it, with a warning.
         """
-        events = [
-            e
-            for e in self.history
-            if e.get("event") in ("quarantine", "quarantine_held")
-            and e.get("file_hash") == file_hash
-        ]
+        events = self._quarantined_by_hash.get(file_hash, [])
         for event in reversed(events):
             name = event.get("quarantine_filename")
             if not name:
@@ -475,19 +432,15 @@ class DocumentProcessor:
     def _relink(self, file_path: Path, entry: dict) -> None:
         """Move `file_path` to the missing file of `entry`, keeping the
         entry's metadata. Journalled before the move, like an ingest."""
-        append_history("relink", **entry, incoming_filename=file_path.name)
         dest_path = config.REFERENCE_DIR / entry["filename"]
-        try:
-            shutil.move(str(file_path), str(dest_path))
-        except BaseException as e:
-            append_history(
-                "ingest_failed",
-                original_filename=file_path.name,
-                filename=entry["filename"],
-                file_hash=entry["file_hash"],
-                error=str(e) or type(e).__name__,
-            )
-            raise
+        journalled_move(
+            "relink",
+            shutil.move,
+            str(file_path),
+            str(dest_path),
+            **entry,
+            incoming_filename=file_path.name,
+        )
         self.relinked.append(
             {"original_filename": file_path.name, "new_filename": entry["filename"]}
         )
@@ -518,6 +471,13 @@ class DocumentProcessor:
         print(f"  Found {len(self.existing_references)} existing entries")
         # Once per run, for the previously-quarantined check (missing -> [])
         self.history = load_history()
+        for event in self.history:
+            if event.get("event") in ("quarantine", "quarantine_held") and event.get(
+                "file_hash"
+            ):
+                self._quarantined_by_hash.setdefault(event["file_hash"], []).append(
+                    event
+                )
 
         # Scan files (sorted for deterministic ingest order: when two files
         # would collide on filename, the alphabetically-first one wins the
@@ -540,7 +500,6 @@ class DocumentProcessor:
             size = pdf.stat().st_size
             if size >= MAX_FILE_SIZE:
                 large_pdfs.append(pdf)
-                self.skipped_large.append(f"{pdf.name} ({size / 1024 / 1024:.1f}MB)")
                 self._record_error(
                     "skip", pdf.name, f"Large PDF ({size / 1024 / 1024:.1f}MB, ≥50MB)"
                 )
@@ -553,7 +512,6 @@ class DocumentProcessor:
 
         # Record non-PDF files
         for f in non_pdf_files:
-            self.skipped_non_pdf.append(f.name)
             self._record_error("skip", f.name, "Not a PDF")
 
         # Process small PDFs. Each file saves references.json as it goes;
@@ -678,8 +636,7 @@ class DocumentProcessor:
             f.write(
                 f"- **Conflicts detected (kept in todo/)**: {len(self.conflicts)}\n"
             )
-            f.write(f"- **Large PDFs skipped (≥50MB)**: {len(self.skipped_large)}\n")
-            f.write(f"- **Non-PDF files skipped**: {len(self.skipped_non_pdf)}\n")
+            f.write(f"- **Skipped (large, non-PDF)**: {len(self._errors_in('skip'))}\n")
             f.write(f"- **Failures**: {len(self.fatal_errors)}\n")
             f.write(f"- **Skipped**: {len(self.skipped_errors)}\n")
             f.write(f"- **Issues logged**: {len(self.log_entries)}\n\n")

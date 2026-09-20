@@ -7,7 +7,6 @@ extracting the common quarantine/update/regenerate/log pattern
 that is shared across all update scripts.
 """
 
-import json
 import shutil
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
@@ -15,7 +14,10 @@ from dataclasses import dataclass
 from src.lib import config
 from src.lib.utils import (
     SUGGESTED_FIELDS,
-    append_history,
+    HistoryWriteError,
+    journalled_move,
+    load_json_or_none,
+    noop,
     calculate_file_hash,
     check_duplicate_filename,
     generate_new_filename,
@@ -44,7 +46,55 @@ class StepError:
     fatal: bool
 
 
-class UpdateStep(ABC):
+class ErrorTrackingStep:
+    """Shared bookkeeping for the two classes that move files in batches:
+    UpdateStep and DocumentProcessor.
+
+    Both record what went wrong as StepErrors, split failures from routine
+    skips the same way, and translate that into the same exit code -- so
+    the rules live here once rather than being kept in sync by hand.
+    """
+
+    def __init__(self):
+        # Single record of everything that went wrong. The per-phase and
+        # fatal views below are derived from it, so they cannot drift.
+        self.errors: list[StepError] = []
+
+    def _record_error(
+        self, phase: str, filename: str, message: str, fatal: bool = False
+    ) -> None:
+        """Record a failure or a skip. See StepError for the distinction."""
+        self.errors.append(StepError(phase, filename, message, fatal))
+
+    def _errors_in(self, phase: str) -> list[StepError]:
+        return [e for e in self.errors if e.phase == phase]
+
+    @property
+    def fatal_errors(self) -> list[StepError]:
+        return [e for e in self.errors if e.fatal]
+
+    @property
+    def skipped_errors(self) -> list[StepError]:
+        return [e for e in self.errors if not e.fatal]
+
+    @staticmethod
+    def _describe(err: StepError) -> str:
+        """One-line rendering of an error, including which phase it came from."""
+        where = f"{err.phase}/{err.filename}" if err.filename else err.phase
+        return f"[{where}] {err.message}"
+
+    @classmethod
+    def run_as_main(cls) -> int:
+        """Entry point for `python -m`: nonzero only on genuine failures.
+
+        Routine skips still exit 0, so `make ingest` and `make update-all`
+        keep chaining through reruns over stale annotations rather than
+        halting on a harmless "already applied".
+        """
+        return 1 if cls().run()["fatal_errors"] else 0
+
+
+class UpdateStep(ErrorTrackingStep, ABC):
     """
     Base class for update scripts that process annotated JSON files.
 
@@ -80,23 +130,12 @@ class UpdateStep(ABC):
         self.updated = 0
         self.processed_files = set()
 
-        # Single record of everything that went wrong. The per-phase and
-        # fatal views below are derived from it, so they cannot drift.
-        self.errors: list[StepError] = []
+        super().__init__()
 
         # Loaded once in run(), mutated in memory, saved once at the end
         # (or on interruption -- see run())
         self.references = []
         self.interrupted = False
-
-    def _record_error(
-        self, phase: str, filename: str, message: str, fatal: bool = False
-    ) -> None:
-        """Record a failure or a skip. See StepError for the distinction."""
-        self.errors.append(StepError(phase, filename, message, fatal))
-
-    def _errors_in(self, phase: str) -> list[StepError]:
-        return [e for e in self.errors if e.phase == phase]
 
     @property
     def quarantine_errors(self) -> list[StepError]:
@@ -107,29 +146,12 @@ class UpdateStep(ABC):
         return self._errors_in("update")
 
     @property
-    def fatal_errors(self) -> list[StepError]:
-        return [e for e in self.errors if e.fatal]
-
-    @property
-    def skipped_errors(self) -> list[StepError]:
-        return [e for e in self.errors if not e.fatal]
-
-    @property
     def quarantine_error_files(self) -> set:
         return {e.filename for e in self.quarantine_errors}
 
     @property
     def update_error_files(self) -> set:
         return {e.filename for e in self.update_errors}
-
-    @classmethod
-    def run_as_main(cls) -> int:
-        """Entry point for `python -m`: nonzero only on genuine failures.
-
-        Routine skips still exit 0, so `make update-all` keeps chaining
-        through reruns over stale annotations.
-        """
-        return 1 if cls().run()["fatal_errors"] else 0
 
     def _read_input_json(self):
         """Read and parse self.input_file, or None if it doesn't exist yet.
@@ -141,14 +163,13 @@ class UpdateStep(ABC):
         and take down the rest of the chain, including `verify`, before
         they run. Subclasses' load_entries() treat None as "no entries".
         """
-        if not self.input_file.exists():
+        data = load_json_or_none(self.input_file)
+        if data is None:
             hint = (
                 f" -- run `make {self.detect_command}`" if self.detect_command else ""
             )
             print(f"No {self.input_filename} yet{hint}.")
-            return None
-        with open(self.input_file, "r", encoding="utf-8") as f:
-            return json.load(f)
+        return data
 
     @abstractmethod
     def load_entries(self) -> list[dict]:
@@ -314,39 +335,21 @@ class UpdateStep(ABC):
                 "file_hash": calculate_file_hash(old_path),
             }
 
-            try:
-                target_name = check_duplicate_filename(
-                    filename, set(), config.QUARANTINE_DIR
-                )
-                append_history(
-                    "quarantine",
-                    **{**removed_entry, "quarantine_filename": target_name},
-                )
-            except Exception as e:
-                print(f"    [!] Error writing history, file not moved: {e}")
-                self._record_error(
-                    "quarantine",
-                    filename,
-                    f"Failed to write history, file not moved: {e}",
-                    fatal=True,
-                )
-                continue
+            target_name = check_duplicate_filename(
+                filename, set(), config.QUARANTINE_DIR
+            )
 
             try:
-                # BaseException so an interrupt landing on the move is
-                # journalled too, before it propagates.
-                try:
-                    shutil.move(str(old_path), str(config.QUARANTINE_DIR / target_name))
-                except BaseException as e:
-                    self._journal_failure(
-                        "quarantine_failed",
-                        filename,
-                        filename=filename,
-                        quarantine_filename=target_name,
-                        file_hash=removed_entry.get("file_hash"),
-                        error=str(e) or type(e).__name__,
-                    )
-                    raise
+                journalled_move(
+                    "quarantine",
+                    shutil.move,
+                    str(old_path),
+                    str(config.QUARANTINE_DIR / target_name),
+                    on_journal_failure=lambda e: self._record_error(
+                        "output", filename, f"Failed to write history: {e}", fatal=True
+                    ),
+                    **{**removed_entry, "quarantine_filename": target_name},
+                )
 
                 # Drop the entry immediately after the move succeeds
                 if current_entry is not None:
@@ -361,21 +364,17 @@ class UpdateStep(ABC):
                         "quarantine", filename, "Entry not in references.json"
                     )
 
+            except HistoryWriteError as e:
+                print(f"    [!] Error writing history, file not moved: {e}")
+                self._record_error(
+                    "quarantine",
+                    filename,
+                    f"Failed to write history, file not moved: {e}",
+                    fatal=True,
+                )
             except Exception as e:
                 print(f"    [!] Error: {e}")
                 self._record_error("quarantine", filename, str(e), fatal=True)
-
-    def _journal_failure(self, event: str, source: str, /, **fields) -> None:
-        """Journal a failed move of `source`. Called while an exception
-        (possibly an interrupt) is propagating, so a failure here is
-        recorded, not raised. Positional-only, as the event fields
-        themselves include `filename`."""
-        try:
-            append_history(event, **fields)
-        except Exception as e:
-            self._record_error(
-                "output", source, f"Failed to write {event} history: {e}", fatal=True
-            )
 
     def _process_updates(self, entries: list[dict]) -> None:
         """
@@ -494,9 +493,16 @@ class UpdateStep(ABC):
             # Journal before touching the file -- also for a metadata-only
             # update (old_filename == filename), so the history always holds
             # the prior -> new metadata. No journal, no rename.
+            renaming = filename != new_filename
+            new_path = config.REFERENCE_DIR / new_filename
             try:
-                append_history(
+                journalled_move(
                     "rename",
+                    (lambda: rename_file(old_path, new_path)) if renaming else noop,
+                    failed_event="rename_failed",
+                    on_journal_failure=lambda e: self._record_error(
+                        "output", filename, f"Failed to write history: {e}", fatal=True
+                    ),
                     old_filename=filename,
                     filename=new_filename,
                     file_hash=current_entry.get("file_hash"),
@@ -512,7 +518,7 @@ class UpdateStep(ABC):
                         "publisher": current_publisher,
                     },
                 )
-            except Exception as e:
+            except HistoryWriteError as e:
                 print(f"    [!] Error writing history, file not renamed: {e}")
                 self._record_error(
                     "update",
@@ -521,33 +527,12 @@ class UpdateStep(ABC):
                     fatal=True,
                 )
                 continue
-
-            # Rename file first so the metadata never points at a missing
-            # file, then update the in-memory entry immediately after, so
-            # an interrupted run saves an entry that matches the disk.
-            if filename != new_filename:
-                new_path = config.REFERENCE_DIR / new_filename
-                try:
-                    # BaseException so an interrupt landing on the rename
-                    # is journalled too, before it propagates.
-                    try:
-                        rename_file(old_path, new_path)
-                    except BaseException as e:
-                        self._journal_failure(
-                            "rename_failed",
-                            filename,
-                            old_filename=filename,
-                            filename=new_filename,
-                            file_hash=current_entry.get("file_hash"),
-                            error=str(e) or type(e).__name__,
-                        )
-                        raise
-                except Exception as e:
-                    print(f"    [!] Error renaming file: {e}")
-                    self._record_error(
-                        "update", filename, f"Error renaming: {e}", fatal=True
-                    )
-                    continue
+            except Exception as e:
+                print(f"    [!] Error renaming file: {e}")
+                self._record_error(
+                    "update", filename, f"Error renaming: {e}", fatal=True
+                )
+                continue
 
             current_entry.update(new_values)
             self.updated += 1
@@ -556,12 +541,6 @@ class UpdateStep(ABC):
                 print(f"    ✓ Renamed to: {new_filename}")
             else:
                 print("    ✓ Metadata updated (filename unchanged)")
-
-    @staticmethod
-    def _describe(err: StepError) -> str:
-        """One-line rendering of an error, including which phase it came from."""
-        where = f"{err.phase}/{err.filename}" if err.filename else err.phase
-        return f"[{where}] {err.message}"
 
     def _print_summary(self, total: int) -> None:
         """Print summary to stdout."""

@@ -16,6 +16,7 @@ from pathlib import Path
 from src.lib import config
 from src.lib.utils import (
     SUGGESTED_FIELDS,
+    load_json_or_none,
     load_references_json,
     flatten_files_from_pairs,
 )
@@ -148,11 +149,9 @@ def check_duplicate_candidates() -> dict:
 def check_metadata_mismatches() -> dict:
     """Check status of metadata_mismatches.json."""
     filepath = config.JSON_OUTPUT_DIR / "metadata_mismatches.json"
-    if not filepath.exists():
+    entries = load_json_or_none(filepath)
+    if entries is None:
         return {"exists": False}
-
-    with open(filepath, "r", encoding="utf-8") as f:
-        entries = json.load(f)
 
     annotated = count_annotated_entries(entries)
 
@@ -174,9 +173,8 @@ def check_todo() -> dict:
     held_duplicates = 0
     held_other = 0
     report_file = config.JSON_OUTPUT_DIR / "ingestion_conflicts.json"
-    if report_file.exists():
-        with open(report_file, "r", encoding="utf-8") as f:
-            report = json.load(f)
+    report = load_json_or_none(report_file)
+    if report is not None:
         for item in report.get("conflicts", []):
             if item.get("original_filename") not in todo_pdfs:
                 continue
